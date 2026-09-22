@@ -1,0 +1,83 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build executable (PyInstaller)
+        run: |
+          pyinstaller --onefile --windowed --uac-admin --name TidyUninstaller --noconfirm mini_geek.py
+
+      - name: Show build output
+        run: Get-ChildItem dist
+
+      - name: Upload unsigned artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TidyUninstaller-unsigned
+          path: dist/TidyUninstaller.exe
+
+      # ---------------------------------------------------------------
+      # SignPath Foundation signing (only on version tags)
+      #
+      # One-time setup after the project is accepted by SignPath:
+      #   1. Install the SignPath GitHub App for this repository
+      #   2. Create a Project and a "release-signing" Signing Policy
+      #      in the SignPath dashboard and replace the slugs below
+      #   3. Add secret SIGNPATH_API_TOKEN (CI user token) in
+      #      GitHub -> Settings -> Secrets and variables -> Actions
+      # ---------------------------------------------------------------
+      - name: Sign with SignPath Foundation
+        if: startsWith(github.ref, 'refs/tags/v') && env.SIGNPATH_API_TOKEN != ''
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 'REPLACE_WITH_YOUR_ORGANIZATION_ID'
+          project-slug: 'tidyuninstaller'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'release'
+          github-artifact-name: 'TidyUninstaller-unsigned'
+          wait-for-completion: true
+          output-artifact-directory: 'dist/signed'
+
+      - name: Prepare release folder
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+          if (Test-Path dist/signed/TidyUninstaller.exe) {
+            Copy-Item dist/signed/TidyUninstaller.exe dist/release/TidyUninstaller.exe -Force
+          } else {
+            Copy-Item dist/TidyUninstaller.exe dist/release/TidyUninstaller.exe -Force
+          }
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/release/TidyUninstaller.exe
