@@ -154,6 +154,31 @@ PS_EXE = next((p for p in _PS_CANDIDATES if p == "powershell" or os.path.exists(
 NO_WINDOW = 0x08000000
 
 
+def _native_sys_dir():
+    """32 位进程在 64 位 Windows 上，System32 会被重定向到 SysWOW64；
+    bcdedit.exe 等工具没有 32 位版本，必须经 Sysnative 调用真实 System32。"""
+    win = os.environ.get("WINDIR", r"C:\Windows")
+    sn = os.path.join(win, "Sysnative")
+    if os.environ.get("PROCESSOR_ARCHITEW6432") and os.path.exists(sn):
+        return sn
+    return os.path.join(win, "System32")
+
+
+SYS_BIN = _native_sys_dir()
+
+
+def TB(name):
+    """系统自带命令行工具的真实路径（绕过 WOW64 重定向）"""
+    return os.path.join(SYS_BIN, name)
+
+
+# 系统盘根目录（360Downloads 等会落在盘根；盘根只做一层目录匹配，不递归）
+SYSTEM_DRIVE_ROOT = os.environ.get("SystemDrive", "C:") + os.sep
+# 真实 System32（32 位进程经 Sysnative），其下 drivers 存放厂商内核驱动 .sys
+NATIVE_SYSTEM32 = SYS_BIN
+DRIVERS_DIR = os.path.join(NATIVE_SYSTEM32, "drivers")
+
+
 def run_ps(script: str, timeout: int = 60) -> str:
     """运行 PowerShell，返回 stdout 文本（中文系统按 GBK 解码）"""
     try:
@@ -1444,14 +1469,107 @@ def scan_vendor_siblings(app, tokens, vendor_kw, add, log):
     add_sibling_dirs(os.path.dirname(vroot), vroot, company, tokens, vendor_kw, add, log)
 
 
+# ---------- 深度系统残留：盘根目录 / 内核驱动文件 / Services 键直扫 ----------
+def scan_deep_system(app, tokens, vendor_kw, add, log):
+    """杀软类软件会把 .sys 放进 System32\\drivers、把服务键藏在 Services 下、
+    把下载目录放在盘根。CIM 枚举可能被自保护 hook 隐藏，这里直接读注册表和文件系统。"""
+    hit_services = set()
+
+    # 1) Services 注册表键直扫（64 位视图），按键名 + ImagePath/DisplayName 匹配
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Services",
+                            0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as base:
+            cnt = winreg.QueryInfoKey(base)[0]
+            for i in range(cnt):
+                try:
+                    name = winreg.EnumKey(base, i)
+                except OSError:
+                    continue
+                img = ""
+                disp = ""
+                try:
+                    with winreg.OpenKey(base, name, 0,
+                                        winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as sk:
+                        try:
+                            img = str(_reg_value(sk, "ImagePath", ""))
+                        except OSError:
+                            img = ""
+                        try:
+                            disp = str(_reg_value(sk, "DisplayName", ""))
+                        except OSError:
+                            disp = ""
+                except OSError:
+                    pass
+                blob = f"{name} {img} {disp}"
+                if not _blob_hit(blob, tokens, vendor_kw):
+                    continue
+                hit_services.add(name)
+                exe = _parse_svc_path(img)
+                log(f"发现厂商服务/驱动（注册表直扫）: {name} → {img[:80]}")
+                if exe and os.path.isfile(exe) and not _is_system_path(exe):
+                    add("file", exe, 9, action={"svc": [name]})
+                else:
+                    # 系统目录内文件不连带删，只删服务注册
+                    add("reg", "", 10, action={"svc": [name]},
+                        reg={"root": winreg.HKEY_LOCAL_MACHINE,
+                             "subkey": r"SYSTEM\CurrentControlSet\Services\\" + name,
+                             "view": winreg.KEY_WOW64_64KEY, "_svc_only": True})
+    except OSError:
+        pass
+
+    # 2) System32\drivers 下的厂商 .sys（含已无服务注册的孤儿驱动）
+    #    仅删除文件名命中厂商关键字的，白名单严格，避免误删系统驱动
+    if os.path.isdir(DRIVERS_DIR):
+        try:
+            for f in os.listdir(DRIVERS_DIR):
+                if not f.lower().endswith(".sys"):
+                    continue
+                stem = f[:-4]
+                if not _blob_hit(stem, tokens, vendor_kw):
+                    continue
+                full = os.path.join(DRIVERS_DIR, f)
+                svc = stem if stem in hit_services or _service_exists(stem) else None
+                log(f"发现厂商内核驱动文件: {full}")
+                add("file", full, 9, allow_system=True,
+                    action={"svc": [stem]} if svc else None)
+        except OSError:
+            pass
+
+    # 3) 系统盘根目录一层（360Downloads、qihu 下载目录等），只看一层不递归
+    for root in (SYSTEM_DRIVE_ROOT,):
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for name in os.listdir(root):
+                full = os.path.join(root, name)
+                if not os.path.isdir(full):
+                    continue
+                if _match_score(name, tokens) >= 6 or _blob_hit(name, [], vendor_kw):
+                    log(f"发现盘根残留目录: {full}")
+                    add("dir", full, 8)
+        except OSError:
+            pass
+
+
+def _service_exists(name: str) -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Services\\" + name,
+                            0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
+            return True
+    except OSError:
+        return False
+
+
 def scan_residual(app: AppEntry, log=print) -> List[dict]:
     """返回残留项 [{type, path, reg(root,subkey[,value]), size, score, action}]"""
     results = []
     seen = set()
 
-    def add(kind, path, score=10, reg=None, action=None):
-        # 系统保护：文件/目录路径硬过滤
-        if kind in ("dir", "file") and path and is_protected_path(path):
+    def add(kind, path, score=10, reg=None, action=None, allow_system=False):
+        # 系统保护：文件/目录路径硬过滤（allow_system 仅用于厂商驱动白名单命中的 System32\drivers 文件）
+        if kind in ("dir", "file") and path and not allow_system and is_protected_path(path):
             return
         # 系统保护：注册表键硬过滤（纯服务删除项除外）
         if kind == "reg" and reg and not reg.get("_svc_only") and is_protected_reg(reg["subkey"]):
@@ -1479,7 +1597,7 @@ def scan_residual(app: AppEntry, log=print) -> List[dict]:
             else:
                 sz = _dir_size_limited(path, budget=2.0)
         results.append({"type": kind, "path": path, "size": sz, "score": score,
-                        "reg": reg, "action": action})
+                        "reg": reg, "action": action, "allow_system": allow_system})
 
     tokens = build_tokens(app)
     vendor_kw = vendor_keywords(app)
@@ -1603,6 +1721,13 @@ def scan_residual(app: AppEntry, log=print) -> List[dict]:
         except Exception as e:
             log(f"兄弟目录扫描失败: {e}")
 
+    # 12) 深度系统残留：盘根目录 / 内核驱动文件 / Services 键直扫（防杀软自保护隐藏）
+    if not app.appx:
+        try:
+            scan_deep_system(app, tokens, vendor_kw, add, log)
+        except Exception as e:
+            log(f"深度系统残留扫描失败: {e}")
+
     results.sort(key=lambda x: -x["score"])
     return results
 
@@ -1665,13 +1790,13 @@ def schedule_reboot_delete(path: str) -> bool:
 
 def force_takeown(path: str):
     try:
-        subprocess.run(["takeown", "/F", path, "/R", "/D", "Y"],
+        subprocess.run([TB("takeown.exe"), "/F", path, "/R", "/D", "Y"],
                        capture_output=True, timeout=60,
                        creationflags=0x08000000)
     except Exception:
         pass
     try:
-        subprocess.run(["icacls", path, "/grant", "*S-1-5-32-544:F", "/T", "/C", "/Q"],
+        subprocess.run([TB("icacls.exe"), path, "/grant", "*S-1-5-32-544:F", "/T", "/C", "/Q"],
                        capture_output=True, timeout=60,
                        creationflags=0x08000000)
     except Exception:
@@ -1688,7 +1813,7 @@ def _procs_under_path(loc: str):
         "Select-Object -ExpandProperty ProcessId"
     )
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+        out = subprocess.run([PS_EXE, "-NoProfile", "-Command", ps],
                              capture_output=True, text=True, encoding="gbk", errors="ignore", timeout=30,
                              creationflags=0x08000000)
         for line in out.stdout.split():
@@ -1716,7 +1841,7 @@ def kill_processes_using(app: AppEntry, log=print):
         killed = 0
         # 1) 按进程映像名杀（同名所有实例 + 进程树）
         for n in names:
-            r = subprocess.run(["taskkill", "/F", "/T", "/IM", n],
+            r = subprocess.run([TB("taskkill.exe"), "/F", "/T", "/IM", n],
                                capture_output=True, text=True, encoding="gbk", errors="ignore",
                                creationflags=0x08000000)
             if r.returncode == 0:
@@ -1725,7 +1850,7 @@ def kill_processes_using(app: AppEntry, log=print):
         # 2) 按安装目录路径杀（守护进程改名也逃不掉）
         if app.location:
             for pid in _procs_under_path(app.location):
-                r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                r = subprocess.run([TB("taskkill.exe"), "/F", "/T", "/PID", str(pid)],
                                    capture_output=True, text=True, encoding="gbk", errors="ignore",
                                    creationflags=0x08000000)
                 if r.returncode == 0:
@@ -1739,7 +1864,7 @@ def kill_processes_using(app: AppEntry, log=print):
 def stop_driver_services(path: str, log=print):
     """sys 驱动文件：先停止并删除对应服务/驱动"""
     try:
-        out = subprocess.run(["sc", "query", "type=", "driver", "state=", "all"],
+        out = subprocess.run([TB("sc.exe"), "query", "type=", "driver", "state=", "all"],
                              capture_output=True, text=True, encoding="gbk", errors="ignore", timeout=30,
                              creationflags=0x08000000).stdout
     except Exception:
@@ -1747,27 +1872,29 @@ def stop_driver_services(path: str, log=print):
     names = re.findall(r"SERVICE_NAME:\s*(\S+)", out)
     for svc in names:
         try:
-            cfg = subprocess.run(["sc", "qc", svc], capture_output=True, text=True, encoding="gbk", errors="ignore",
+            cfg = subprocess.run([TB("sc.exe"), "qc", svc], capture_output=True, text=True, encoding="gbk", errors="ignore",
                                  timeout=10, creationflags=0x08000000).stdout
             m = re.search(r"BINARY_PATH_NAME\s*:\s*(.+)", cfg)
             if m and os.path.basename(path).lower() in m.group(1).lower():
                 log(f"停止并删除驱动服务: {svc}")
-                subprocess.run(["sc", "stop", svc], capture_output=True,
+                subprocess.run([TB("sc.exe"), "stop", svc], capture_output=True,
                                creationflags=0x08000000)
                 time.sleep(1)
-                subprocess.run(["sc", "delete", svc], capture_output=True,
+                subprocess.run([TB("sc.exe"), "delete", svc], capture_output=True,
                                creationflags=0x08000000)
         except Exception:
             continue
 
 
-def force_delete(path: str, log=print, reboot_list: Optional[list] = None) -> bool:
-    """强删文件/目录，含占用处理；失败则标记重启删除"""
+def force_delete(path: str, log=print, reboot_list: Optional[list] = None,
+                 allow_system: bool = False) -> bool:
+    """强删文件/目录，含占用处理；失败则标记重启删除。
+    allow_system=True 仅用于扫描阶段已确认命中厂商白名单的 System32\\drivers 驱动文件。"""
     if reboot_list is None:
         reboot_list = []
     if not os.path.exists(path):
         return True
-    if is_protected_path(path):
+    if not allow_system and is_protected_path(path):
         log(f"[拦截] 系统保护路径，拒绝删除: {path}")
         return False
     log(f"强制删除: {path}")
@@ -1804,7 +1931,7 @@ def force_delete(path: str, log=print, reboot_list: Optional[list] = None) -> bo
     for dp, dns, fns in os.walk(path, topdown=False):
         for f in fns:
             fp = os.path.join(dp, f)
-            if not force_delete(fp, log, reboot_list):
+            if not force_delete(fp, log, reboot_list, allow_system=allow_system):
                 ok = False
     try:
         shutil.rmtree(path, ignore_errors=False)
@@ -1843,7 +1970,7 @@ def delete_reg(reg: dict, log=print) -> bool:
         rootname = "HKLM" if root == winreg.HKEY_LOCAL_MACHINE else "HKCU"
         view_flag = "/reg:64" if view == winreg.KEY_WOW64_64KEY else (
             "/reg:32" if view == winreg.KEY_WOW64_32KEY else "")
-        cmd = ["reg", "delete", rootname + "\\" + sub, "/f"] + ([view_flag] if view_flag else [])
+        cmd = [TB("reg.exe"), "delete", rootname + "\\" + sub, "/f"] + ([view_flag] if view_flag else [])
         r = subprocess.run(cmd, capture_output=True, creationflags=0x08000000)
         if r.returncode == 0:
             log(f"删除注册表项: {sub}")
@@ -1861,7 +1988,7 @@ def delete_reg_value(reg: dict, log=print) -> bool:
         rootname = "HKLM" if root == winreg.HKEY_LOCAL_MACHINE else "HKCU"
         view_flag = "/reg:64" if view == winreg.KEY_WOW64_64KEY else (
             "/reg:32" if view == winreg.KEY_WOW64_32KEY else "")
-        cmd = ["reg", "delete", rootname + "\\" + sub, "/v", value, "/f"] + \
+        cmd = [TB("reg.exe"), "delete", rootname + "\\" + sub, "/v", value, "/f"] + \
               ([view_flag] if view_flag else [])
         r = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW)
         if r.returncode == 0:
@@ -1877,23 +2004,23 @@ def perform_actions(item: dict, log=print):
     """删除残留前先执行关联动作：杀进程、停删服务/驱动、删计划任务"""
     act = item.get("action") or {}
     for pid in act.get("kill", []):
-        r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+        r = subprocess.run([TB("taskkill.exe"), "/F", "/T", "/PID", str(pid)],
                            capture_output=True, text=True, encoding="gbk", errors="ignore",
                            creationflags=NO_WINDOW)
         if r.returncode == 0:
             log(f"结束同厂商进程 PID {pid}")
     for svc in act.get("svc", []):
         log(f"停止并删除服务/驱动: {svc}")
-        subprocess.run(["sc", "stop", svc], capture_output=True, creationflags=NO_WINDOW)
+        subprocess.run([TB("sc.exe"), "stop", svc], capture_output=True, creationflags=NO_WINDOW)
         time.sleep(0.8)
-        r = subprocess.run(["sc", "delete", svc], capture_output=True,
+        r = subprocess.run([TB("sc.exe"), "delete", svc], capture_output=True,
                            text=True, encoding="gbk", errors="ignore", creationflags=NO_WINDOW)
         if r.returncode != 0:
             delete_reg({"root": winreg.HKEY_LOCAL_MACHINE,
                         "subkey": r"SYSTEM\CurrentControlSet\Services\\" + svc,
                         "view": winreg.KEY_WOW64_64KEY}, log)
     for task in act.get("task", []):
-        r = subprocess.run(["schtasks", "/delete", "/tn", task, "/f"],
+        r = subprocess.run([TB("schtasks.exe"), "/delete", "/tn", task, "/f"],
                            capture_output=True, text=True, encoding="gbk", errors="ignore",
                            creationflags=NO_WINDOW)
         if r.returncode == 0:
@@ -1915,7 +2042,7 @@ def reboot_now(log=print) -> bool:
     except Exception:
         pass
     try:
-        subprocess.run(["shutdown", "/r", "/t", "5", "/c",
+        subprocess.run([TB("shutdown.exe"), "/r", "/t", "5", "/c",
                         "Mini Geek Uninstaller 完成重启删除"], creationflags=NO_WINDOW)
         return True
     except Exception as e:
@@ -1947,92 +2074,192 @@ SAFEMODE_LOG = os.path.join(SAFEMODE_DIR, "clean.log")
 SAFEMODE_TASK = "MiniGeekSafeClean"
 
 
-def prepare_safemode_cleanup(items: list, log=print) -> bool:
-    """落盘删除清单 + 复制自身 + 注册 SYSTEM 开机任务 + 配置安全模式引导"""
+def prepare_safemode_cleanup(items: list, app=None, log=print):
+    """落盘删除清单 + 复制自身 + 注册 SYSTEM 开机任务 + 配置安全模式引导。
+    返回 (ok: bool, detail: str)，detail 为失败时的真实原因。"""
+    detail = ""
     try:
         os.makedirs(SAFEMODE_DIR, exist_ok=True)
-        # 1) 序列化删除清单
-        plan = []
+        # 1) 序列化删除清单 + 软件快照（安全模式现场重扫需要）
+        plan_items = []
         for it in items:
-            plan.append({
+            plan_items.append({
                 "type": it["type"], "path": it.get("path") or "",
                 "reg": it.get("reg"), "action": it.get("action"),
+                "allow_system": it.get("allow_system", False),
             })
+        app_snap = None
+        if app is not None:
+            app_snap = {
+                "name": getattr(app, "name", "") or "",
+                "publisher": getattr(app, "publisher", "") or "",
+                "location": getattr(app, "location", "") or "",
+                "company": getattr(app, "company", "") or "",
+            }
+        plan = {"app": app_snap, "items": plan_items}
         with open(SAFEMODE_PLAN, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=1)
         # 2) 复制自身到 ProgramData（不依赖外部盘）
         src = sys.executable
-        if os.path.exists(src):
+        if not os.path.exists(src):
+            return False, f"找不到自身程序：{src}"
+        try:
             shutil.copy2(src, SAFEMODE_EXE)
-        else:
-            log("找不到自身 exe，无法部署安全模式清理程序")
-            return False
-        # 3) 注册 SYSTEM 权限、开机即运行的计划任务（安全模式登录前执行，无需 UAC）
-        subprocess.run(["schtasks", "/delete", "/tn", SAFEMODE_TASK, "/f"],
+        except Exception as e:
+            return False, f"复制清理程序失败：{e}"
+        # 3) 关键：把任务计划服务加入安全模式启动白名单，
+        #    否则安全模式默认禁止 Schedule 服务（系统错误 1084），开机任务不会运行
+        try:
+            r_sb = subprocess.run(
+                [TB("reg.exe"), "add",
+                 r"HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal\Schedule",
+                 "/ve", "/t", "REG_SZ", "/d", "Service", "/f"],
+                capture_output=True, text=True, encoding="gbk", errors="ignore",
+                creationflags=NO_WINDOW)
+            if r_sb.returncode != 0:
+                log("警告：无法写入安全模式服务白名单: " + (r_sb.stderr or r_sb.stdout or ""))
+        except Exception as e:
+            log(f"警告：写入安全模式白名单异常: {e}")
+        # 4) 注册 SYSTEM 权限、开机即运行的计划任务（安全模式登录前执行，无需 UAC）
+        subprocess.run([TB("schtasks.exe"), "/delete", "/tn", SAFEMODE_TASK, "/f"],
                        capture_output=True, creationflags=NO_WINDOW)
         tr = f'"{SAFEMODE_EXE}" --safemode-clean'
-        r = subprocess.run(["schtasks", "/create", "/tn", SAFEMODE_TASK, "/tr", tr,
+        r = subprocess.run([TB("schtasks.exe"), "/create", "/tn", SAFEMODE_TASK, "/tr", tr,
                             "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f"],
                            capture_output=True, text=True, encoding="gbk", errors="ignore",
                            creationflags=NO_WINDOW)
         if r.returncode != 0:
-            log("计划任务创建失败: " + (r.stderr or r.stdout or ""))
-            return False
-        # 4) 配置安全模式引导
-        r1 = subprocess.run(["bcdedit", "/set", "{current}", "safeboot", "minimal"],
+            detail = (r.stderr or r.stdout or "").strip()
+            return False, f"创建开机计划任务失败（返回码 {r.returncode}）：{detail}"
+        # 5) 配置安全模式引导
+        r1 = subprocess.run([TB("bcdedit.exe"), "/set", "{current}", "safeboot", "minimal"],
                             capture_output=True, text=True, encoding="gbk", errors="ignore",
                             creationflags=NO_WINDOW)
         if r1.returncode != 0:
-            log("bcdedit 配置安全模式失败: " + (r1.stderr or r1.stdout or ""))
-            return False
+            detail = (r1.stderr or r1.stdout or "").strip()
+            # 回滚已建任务，避免留下半套部署
+            subprocess.run([TB("schtasks.exe"), "/delete", "/tn", SAFEMODE_TASK, "/f"],
+                           capture_output=True, creationflags=NO_WINDOW)
+            return False, f"配置安全模式引导失败（返回码 {r1.returncode}）：{detail}"
         log("安全模式清理已部署：重启后将自动进入安全模式执行删除，完成后自动回到正常模式。")
-        return True
+        return True, "ok"
     except Exception as e:
-        log(f"部署安全模式清理失败: {e}")
-        return False
+        return False, f"部署异常：{e}"
 
 
 def reboot_to_safemode():
-    subprocess.run(["shutdown", "/r", "/t", "6", "/c",
+    subprocess.run([TB("shutdown.exe"), "/r", "/t", "6", "/c",
                     "Mini Geek Uninstaller：即将进入安全模式彻底清理"], creationflags=NO_WINDOW)
 
 
+def _merge_items(base: list, extra: list) -> list:
+    """按 (type,path/reg) 去重合并，action 取并集"""
+    out = []
+    seen = {}
+    for it in base + extra:
+        key = (it.get("type"),
+               (it.get("path") or "").lower() or json.dumps(it.get("reg"), default=str))
+        if key in seen:
+            idx = seen[key]
+            a1, a2 = out[idx].get("action") or {}, it.get("action") or {}
+            merged = {}
+            for k in set(a1) | set(a2):
+                merged[k] = list(dict.fromkeys(a1.get(k, []) + a2.get(k, [])))
+            out[idx]["action"] = merged or None
+            if it.get("allow_system"):
+                out[idx]["allow_system"] = True
+        else:
+            seen[key] = len(out)
+            out.append(dict(it))
+    return out
+
+
 def run_safemode_cleanup():
-    """安全模式下由计划任务以 SYSTEM 身份调用：执行清单、恢复引导、重启回正常模式"""
+    """安全模式下由计划任务以 SYSTEM 身份调用：先恢复引导（防卡死）→
+    现场深扫（无自保护，抓隐藏服务/驱动）→ 执行清单 → 删任务 → 重启回正常模式。"""
+    logf = None
+
+    def wlog(s):
+        line = f"[{datetime.now():%H:%M:%S}] {s}\n"
+        try:
+            if logf is not None:
+                logf.write(line); logf.flush()
+                os.fsync(logf.fileno())
+        except Exception:
+            pass
+        try:
+            with open(SAFEMODE_LOG, "a", encoding="utf-8") as f2:
+                f2.write(line)
+        except Exception:
+            pass
+
     try:
         os.makedirs(SAFEMODE_DIR, exist_ok=True)
         logf = open(SAFEMODE_LOG, "a", encoding="utf-8")
-
-        def wlog(s):
-            try:
-                logf.write(f"[{datetime.now():%H:%M:%S}] {s}\n"); logf.flush()
-            except Exception:
-                pass
     except Exception:
-        def wlog(s):
-            pass
-
+        logf = None
     wlog("==== 安全模式清理开始 ====")
+
+    # 第 0 步（最高优先）：先恢复正常引导。即使后续进程崩溃，下次启动也回正常模式，
+    # 不会把用户困在安全模式；开机任务保留，正常模式下若再触发会幂等重跑并自愈。
+    try:
+        r0 = subprocess.run([TB("bcdedit.exe"), "/deletevalue", "{current}", "safeboot"],
+                            capture_output=True, text=True, encoding="gbk", errors="ignore",
+                            creationflags=NO_WINDOW)
+        wlog("预先清除 safeboot 引导: " +
+             ("成功" if r0.returncode == 0 else (r0.stderr or r0.stdout or "").strip()))
+    except Exception as e:
+        wlog(f"预先清除 safeboot 异常: {e}")
+
+    reboot_list = []
+    fatal = ""
     try:
         enable_debug_privilege()
-        reboot_list = []
+        # 读取清单（兼容旧版纯列表格式）
+        app_snap = None
+        items = []
         try:
             with open(SAFEMODE_PLAN, "r", encoding="utf-8") as f:
-                items = json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict):
+                app_snap = data.get("app")
+                items = data.get("items", [])
+            else:
+                items = data
         except Exception as e:
             wlog(f"读取清单失败: {e}")
-            items = []
-        # 先执行所有动作（杀进程/停删服务/删任务），再删文件注册表
-        for it in items:
+        wlog(f"清单项目 {len(items)} 个")
+
+        # 现场深扫：安全模式无杀软自保护，重新枚举隐藏的服务/驱动/目录后合并
+        if app_snap and (app_snap.get("name") or app_snap.get("location")):
+            try:
+                tmp = AppEntry(name=app_snap.get("name", ""))
+                tmp.name = app_snap.get("name", "")
+                tmp.publisher = app_snap.get("publisher", "")
+                tmp.location = app_snap.get("location", "")
+                tmp.company = app_snap.get("company", "")
+                extra = scan_residual(tmp, wlog)
+                before = len(items)
+                items = _merge_items(items, extra)
+                wlog(f"安全模式现场重扫：新增 {len(items) - before} 项，合并后共 {len(items)} 项")
+            except Exception as e:
+                wlog(f"现场重扫失败（继续执行原清单）: {e}")
+
+        # 第 1 轮：关联动作（杀进程 / 停删服务 / 删任务）
+        wlog("---- 第 1 轮：进程/服务/任务 ----")
+        for i, it in enumerate(items):
             try:
                 perform_actions(it, wlog)
             except Exception as e:
-                wlog(f"动作失败: {e}")
-        for it in items:
+                wlog(f"动作失败[{i}]: {e}")
+        # 第 2 轮：文件 / 目录 / 注册表
+        wlog("---- 第 2 轮：文件与注册表 ----")
+        for i, it in enumerate(items):
             t = it.get("type")
             try:
                 if t in ("dir", "file") and it.get("path"):
-                    force_delete(it["path"], wlog, reboot_list)
+                    force_delete(it["path"], wlog, reboot_list,
+                                 allow_system=it.get("allow_system", False))
                 elif t == "reg" and it.get("reg"):
                     if it["reg"].get("_svc_only"):
                         continue
@@ -2040,30 +2267,48 @@ def run_safemode_cleanup():
                 elif t == "regvalue" and it.get("reg"):
                     delete_reg_value(it["reg"], wlog)
             except Exception as e:
-                wlog(f"删除失败 {it.get('path') or it.get('reg')}: {e}")
+                wlog(f"删除失败[{i}] {it.get('path') or it.get('reg')}: {e}")
         wlog(f"重启删除标记 {len(reboot_list)} 项")
-    finally:
-        # 无论成败都恢复正常引导并删除自身任务，防止卡死在安全模式
-        try:
-            r = subprocess.run(["bcdedit", "/deletevalue", "{current}", "safeboot"],
-                               capture_output=True, text=True, encoding="gbk", errors="ignore",
-                               creationflags=NO_WINDOW)
-            wlog("清除 safeboot 引导: " + ("成功" if r.returncode == 0 else (r.stderr or r.stdout or "")))
-        except Exception as e:
-            wlog(f"清除 safeboot 引导异常: {e}")
-        try:
-            subprocess.run(["schtasks", "/delete", "/tn", SAFEMODE_TASK, "/f"],
-                           capture_output=True, creationflags=NO_WINDOW)
-        except Exception:
-            pass
-        wlog("==== 清理结束，10 秒后重启回正常模式 ====")
-        try:
+    except Exception as e:
+        import traceback
+        fatal = str(e)
+        wlog("清理流程异常: " + traceback.format_exc()[:1500])
+
+    # 收尾：再次确保引导正常 + 删除开机任务
+    try:
+        subprocess.run([TB("bcdedit.exe"), "/deletevalue", "{current}", "safeboot"],
+                       capture_output=True, creationflags=NO_WINDOW)
+    except Exception:
+        pass
+    try:
+        subprocess.run([TB("schtasks.exe"), "/delete", "/tn", SAFEMODE_TASK, "/f"],
+                       capture_output=True, creationflags=NO_WINDOW)
+        wlog("已删除开机清理任务")
+    except Exception:
+        pass
+    # 清理安全模式服务白名单键（恢复系统原状）
+    try:
+        subprocess.run([TB("reg.exe"), "delete",
+                        r"HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal\Schedule",
+                        "/f"], capture_output=True, creationflags=NO_WINDOW)
+    except Exception:
+        pass
+    wlog("==== 清理结束" + (f"（含异常: {fatal}）" if fatal else "") + "，准备重启回正常模式 ====")
+    try:
+        if logf is not None:
             logf.close()
+    except Exception:
+        pass
+    time.sleep(5)
+    # 重启：优先 shutdown.exe，失败用 ExitWindowsEx 兜底
+    try:
+        subprocess.run([TB("shutdown.exe"), "/r", "/t", "3", "/c",
+                        "安全模式清理完成，返回正常系统"], creationflags=NO_WINDOW, timeout=15)
+    except Exception:
+        try:
+            ctypes.windll.user32.ExitWindowsEx(0x2 | 0x10, 0x80000000 | (0x2 << 16) | (0x3 << 2))
         except Exception:
             pass
-        time.sleep(10)
-        subprocess.run(["shutdown", "/r", "/t", "3", "/c", "安全模式清理完成，返回正常系统"],
-                       creationflags=NO_WINDOW)
 
 
 def native_uninstall(app: AppEntry, log=print) -> bool:
@@ -2387,7 +2632,7 @@ class App(tk.Tk):
         rootname = "HKEY_LOCAL_MACHINE" if app.reg_root == winreg.HKEY_LOCAL_MACHINE else "HKEY_CURRENT_USER"
         key = rootname + "\\" + app.reg_subkey
         try:
-            subprocess.run(["reg", "add",
+            subprocess.run([TB("reg.exe"), "add",
                             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Applets\Regedit",
                             "/v", "LastKey", "/t", "REG_SZ", "/d", key, "/f"],
                            capture_output=True)
@@ -2447,7 +2692,7 @@ class App(tk.Tk):
             exe = re.match(r'"?([^"]+\.exe)', cmd)
             if exe:
                 name = os.path.basename(exe.group(1))
-                r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}"],
+                r = subprocess.run([TB("tasklist.exe"), "/FI", f"IMAGENAME eq {name}"],
                                    capture_output=True, text=True, encoding="gbk", errors="ignore",
                                    creationflags=NO_WINDOW)
                 if name.lower() not in r.stdout.lower():
@@ -2706,9 +2951,16 @@ class ResidualDialog(tk.Toplevel):
                 f"本次将清理 {len(chosen)} 个项目。过程中电脑会自动重启两次，\n"
                 "请先保存其他工作。确定继续？", parent=self, icon="warning"):
             return
-        if not prepare_safemode_cleanup(chosen, print):
-            messagebox.showerror("失败",
-                                 "部署安全模式清理失败（需要管理员权限）。", parent=self)
+        ok, detail = prepare_safemode_cleanup(chosen, self.app, print)
+        if not ok:
+            messagebox.showerror(
+                "部署失败",
+                "安全模式清理部署失败：\n\n" + detail +
+                "\n\n常见原因：\n"
+                "1) 未用管理员身份运行（请右键以管理员身份运行）；\n"
+                "2) 安全软件拦截了计划任务创建或引导修改（请在 360 弹窗中选择允许，"
+                "或临时关闭自我保护后重试）。",
+                parent=self)
             return
         try:
             self.destroy()
@@ -2748,7 +3000,8 @@ class ResidualDialog(tk.Toplevel):
                 try:
                     t = it["type"]
                     if t in ("dir", "file") and it["path"]:
-                        if not force_delete(it["path"], log, self.reboot):
+                        if not force_delete(it["path"], log, self.reboot,
+                                            allow_system=it.get("allow_system", False)):
                             fail[0] += 1
                     elif t == "reg":
                         reg = it["reg"]
