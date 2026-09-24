@@ -17,38 +17,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Build with MSVC
+        shell: cmd
+        working-directory: src
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Build executable (PyInstaller)
-        run: |
-          pyinstaller --onefile --windowed --uac-admin --name TidyUninstaller --noconfirm mini_geek.py
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          rc /nologo resource.rc
+          cl /nologo /O2 /MT /utf-8 /DUNICODE /D_UNICODE main.cpp resource.res /link /SUBSYSTEM:WINDOWS /OUT:JEVILUninstaller.exe
 
       - name: Show build output
-        run: Get-ChildItem dist
+        shell: cmd
+        working-directory: src
+        run: dir *.exe
 
       - name: Upload unsigned artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TidyUninstaller-unsigned
-          path: dist/TidyUninstaller.exe
+          name: JEVILUninstaller-unsigned
+          path: src/JEVILUninstaller.exe
 
       # ---------------------------------------------------------------
-      # SignPath Foundation signing (only on version tags)
-      #
-      # One-time setup after the project is accepted by SignPath:
+      # SignPath Foundation signing (only on version tags).
+      # Enabled after the project is accepted:
       #   1. Install the SignPath GitHub App for this repository
-      #   2. Create a Project and a "release-signing" Signing Policy
-      #      in the SignPath dashboard and replace the slugs below
-      #   3. Add secret SIGNPATH_API_TOKEN (CI user token) in
-      #      GitHub -> Settings -> Secrets and variables -> Actions
+      #   2. Create a Project and a release signing policy in SignPath
+      #   3. Add secret SIGNPATH_API_TOKEN and replace the slugs below
       # ---------------------------------------------------------------
       - name: Sign with SignPath Foundation
         if: startsWith(github.ref, 'refs/tags/v') && env.SIGNPATH_API_TOKEN != ''
@@ -58,26 +52,26 @@ jobs:
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: 'REPLACE_WITH_YOUR_ORGANIZATION_ID'
-          project-slug: 'tidyuninstaller'
+          project-slug: 'jevil-uninstaller'
           signing-policy-slug: 'release-signing'
           artifact-configuration-slug: 'release'
-          github-artifact-name: 'TidyUninstaller-unsigned'
+          github-artifact-name: 'JEVILUninstaller-unsigned'
           wait-for-completion: true
-          output-artifact-directory: 'dist/signed'
+          output-artifact-directory: src/signed
 
       - name: Prepare release folder
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
-          if (Test-Path dist/signed/TidyUninstaller.exe) {
-            Copy-Item dist/signed/TidyUninstaller.exe dist/release/TidyUninstaller.exe -Force
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          if (Test-Path src/signed/JEVILUninstaller.exe) {
+            Copy-Item src/signed/JEVILUninstaller.exe release/JEVILUninstaller.exe -Force
           } else {
-            Copy-Item dist/TidyUninstaller.exe dist/release/TidyUninstaller.exe -Force
+            Copy-Item src/JEVILUninstaller.exe release/JEVILUninstaller.exe -Force
           }
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/release/TidyUninstaller.exe
+          files: release/JEVILUninstaller.exe
