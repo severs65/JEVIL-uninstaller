@@ -1,88 +1,51 @@
-# TidyUninstaller
+# JEVIL Uninstaller
 
-A lightweight, portable Windows uninstaller with a clean, classic desktop UI.
-It lists installed desktop applications, Microsoft Store (Appx/UWP) packages and
-portable apps, runs the original uninstaller, scans for leftover files, folders,
-registry keys, services, scheduled tasks and autostart entries, and lets you
-review every item before removal.
+一个轻量的 Windows 软件卸载与残留清理工具。使用 C++ / Win32 原生编写，编译为单个可执行文件，**无需安装任何运行环境，双击即可使用**。界面简洁，中文显示。
 
-Single executable, no runtime required (built with PyInstaller), no background
-service, no telemetry.
+## 功能
 
-## Features
+- **程序列表**：枚举系统中已安装的软件并显示名称、大小、安装日期与图标；同时识别没有标准注册表卸载项的程序、用户级安装程序和 UWP（微软商店）应用。
+- **正常卸载**：先调用软件自带的卸载程序，完成后扫描残留，由用户**逐项勾选**要清理的文件、文件夹和注册表项。
+- **强制移除**：当软件自带卸载不可用或文件被占用时，可停止相关进程与服务、重置文件权限后移除；仍无法删除的项目登记为系统重启后自动删除。
+- **安装监控**（可选）：记录安装过程产生的变化，便于日后还原。
 
-- **Installed apps inventory**
-  - Classic Win32 desktop programs from the registry uninstall keys
-    (64-bit and 32-bit views, machine and user hives)
-  - Microsoft Store / Appx / UWP packages for the current user
-  - Portable applications discovered in common locations
-  - Real application icons extracted from executables and package assets
-- **Normal uninstall**
-  - Runs the program's original/uninstall string first
-  - Then scans and presents leftovers for optional, item-by-item cleanup
-- **Force removal**
-  - For broken installations and programs without an uninstaller
-  - Stops related processes, Windows services and kernel drivers registered
-    by the same vendor, removes scheduled tasks and Run/RunOnce autostart entries
-  - Takes ownership of protected files where the current user is allowed to
-  - Files that are locked by the running system are scheduled for deletion on
-    next reboot using the standard Windows `MoveFileEx` mechanism, with an
-    optional automatic restart prompt
-  - **Safe Mode cleanup**: when a security product's self-protection blocks
-    removal in normal mode, the tool can deploy a one-time cleanup task, reboot
-    into Windows Safe Mode (where third-party self-protection drivers are not
-    loaded by design), perform the deletion under the SYSTEM account, restore
-    normal boot and reboot again. The boot configuration is always restored,
-    even if cleanup fails.
-- **Leftover detection**
-  - Install directories and sibling product folders from the same vendor
-  - Program data and per-user application data folders
-  - Uninstall and vendor registry keys, Run/RunOnce autostart values
-  - Windows services and kernel drivers whose image path belongs to the product
-  - Scheduled tasks
-  - Browser extensions (Chromium-based browsers) installed by the software
-  - Running processes are correlated by install path and by the executable's
-    embedded company name, which also catches randomly named folders
-- **Install monitor** (optional, from the Settings menu) records file and
-  registry changes made by an installer and can restore them
-- Built-in allowlists protect Windows system directories and core registry
-  hives from accidental deletion
+## 安全设计
 
-## Safety
+本工具会修改系统文件与注册表，因此默认采取保守、可恢复的策略：
 
-TidyUninstaller never hides what it removes: every detected leftover is shown
-in a checklist with its category, size and the action that will be taken.
-Nothing is deleted without explicit confirmation. The tool requests an
-administrator token because uninstallation inherently requires one.
+- **受保护位置不删除**：系统关键服务与驱动、Windows 目录、Program Files 与 ProgramData 等顶层目录、用户配置关键目录一律受保护，不会被批量移除。
+- **删除前确认**：所有残留项以列表展示并默认由用户勾选，不做无提示删除。
+- **注册表备份**：删除注册表项前自动导出备份到 `C:\ProgramData\JEVILRegBackup`，需要时可手动还原。
+- **不常驻、不联网**：程序不设置开机自启动，不收集任何数据，不发起网络请求。
 
-It does **not** attempt to bypass operating-system or security-software
-protection. Security products with kernel self-protection cannot (and should
-not) be removed while running; the supported path is the vendor's own
-uninstaller or the Safe Mode cleanup workflow described above.
+## 系统要求
 
-## Download
+- Windows 10 / Windows 11（64 位）。
+- 部分操作需要管理员权限，程序会通过 UAC 主动请求。
 
-See [Releases](../../releases) for the signed single-file executable.
-Windows 10/11, 64-bit. Portable: just run it.
+## 从源码构建
 
-## Build from source
+需安装 Visual Studio（含 C++ 桌面开发组件，MSVC + Windows SDK）。
 
-Requires Python 3.11.
+在 `src` 目录下执行：
 
 ```bat
-pip install -r requirements.txt
-pyinstaller --onefile --windowed --uac-admin --name TidyUninstaller --noconfirm mini_geek.py
+build.bat
 ```
 
-The executable is written to `dist\TidyUninstaller.exe`.
+或手动编译（在 “x64 Native Tools Command Prompt” 中）：
 
-## License
+```bat
+rc /nologo resource.rc
+cl /nologo /O2 /MT /utf-8 /DUNICODE /D_UNICODE main.cpp resource.res /link /SUBSYSTEM:WINDOWS /OUT:JEVILUninstaller.exe
+```
 
-MIT, see [LICENSE](LICENSE).
+`/MT` 为静态链接，生成的 exe 不依赖 VC++ 运行库，可在其他电脑直接运行。
 
-## Code signing
+## 发布与签名
 
-Free code signing for open-source projects is provided by
-[SignPath.io](https://signpath.io/), certificate by the
-[SignPath Foundation](https://signpath.org/). Release artifacts are built and
-signed by the public GitHub Actions workflow in this repository.
+正式发布的可执行文件**仅由本公开仓库的源代码经 GitHub Actions 构建产生**，构建脚本见 `.github/workflows/build.yml`，保证产物可复现、可审计。
+
+## 许可证
+
+[MIT License](LICENSE)，为 OSI 认可的开源许可证。
