@@ -1,0 +1,6 @@
+#include <windows.h>
+
+1 24 "app.manifest"
+
+#define IDI_APPICON 101
+IDI_APPICON ICON "app.ico"

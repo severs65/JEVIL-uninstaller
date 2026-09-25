@@ -1,0 +1,28 @@
+SAFETY NOTES for JEVIL‑uninstaller
+
+This is an open‑source Windows uninstall utility.
+
+1. The program performs static‑only enumeration of registry and file system.
+No dynamic EXE analysis, no process debugging, hooking or code injection.
+No kernel‑mode driver is used.
+
+2. Service startup type modification:
+The program has the ability to change service Start registry value.
+Filter rules have existed since early versions: setting Start=4(disable) is only allowed for third‑party services belonging to the software you are uninstalling.
+Native Windows system services and drivers will never be disabled by this tool.
+
+3. Reboot‑delayed deletion (MoveFileEx MOVEFILE_DELAY_UNTIL_REBOOT):
+This is an optional advanced feature and NOT turned on by default.
+System‑protected folders are blacklisted, blacklisted path items will never be scheduled for reboot deletion.
+User must manually confirm after seeing UI warning before using this function.
+
+4. Residue scan works as dry‑run preview mode.
+The software will NEVER delete anything automatically.
+All delete actions require explicit user selection and confirmation.
+
+5. Headless command‑line mode:
+There is no file encryption or decryption functionality in CLI mode.
+
+6. Safe‑mode switching is not implemented.
+
+All release binaries are built by CI pipeline from public source code.
