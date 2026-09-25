@@ -11,6 +11,9 @@
 #include <strsafe.h>
 #include <windowsx.h>
 #include <setupapi.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <wincrypt.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -22,6 +25,8 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 
 // 非即插即用驱动设备类（设备管理器“显示隐藏设备 → 非即插即用驱动程序”）
 // 对应注册表 ROOT\LEGACY_<服务名>\0000
@@ -560,6 +565,175 @@ static std::wstring EnvPath(const wchar_t* env) {
     return b;
 }
 
+// ==================================================================
+// 数字签名验证 / PE 静态依赖分析 / 随机目录识别
+// ==================================================================
+
+static int  VerifyFileSignature(const std::wstring&);
+static bool IsSystemDirTree(const std::wstring&);
+
+// 签名归属分类：0=微软/Windows 系统签名；1=其他有效签名(第三方)；2=无签名；3=签名无效
+static int ClassifyFileSignature(const std::wstring& path) {
+    // 先验证签名有效性
+    int v = VerifyFileSignature(path);
+    if (v == 1) return 2;
+    if (v == 2) return 3;
+    // 有效：读取证书主体，判断是否微软 Windows 签名
+    HCERTSTORE hStore = nullptr; HCRYPTMSG hMsg = nullptr;
+    DWORD enc=0, cont=0, fmt=0; CMSG_SIGNER_INFO* signer=nullptr; CERT_INFO* ci=nullptr;
+    BOOL q = CryptQueryObject(CERT_QUERY_OBJECT_FILE, path.c_str(),
+        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED, CERT_QUERY_FORMAT_FLAG_BINARY, 0,
+        &enc, &cont, &fmt, &hStore, &hMsg, nullptr);
+    int cls = 1;
+    if (q) {
+        DWORD info=0;
+        CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &info);
+        std::vector<BYTE> sb(info);
+        if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, sb.data(), &info)) {
+            signer = (CMSG_SIGNER_INFO*)sb.data();
+            CERT_INFO ci2; ZeroMemory(&ci2,sizeof(ci2));
+            ci2.Issuer = signer->Issuer;
+            ci2.SerialNumber = signer->SerialNumber;
+            PCCERT_CONTEXT pc = CertFindCertificateInStore(hStore,
+                X509_ASN_ENCODING|PKCS_7_ASN_ENCODING, 0,
+                CERT_FIND_SUBJECT_CERT, &ci2, nullptr);
+            if (pc) {
+                wchar_t sub[512]={0};
+                CertGetNameStringW(pc, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, sub, 512);
+                std::wstring s = Lower(sub);
+                if (s.find(L"microsoft windows") != std::wstring::npos ||
+                    s.find(L"microsoft windows hardware") != std::wstring::npos ||
+                    s.find(L"microsoft corporation") != std::wstring::npos)
+                    cls = 0;
+                CertFreeCertificateContext(pc);
+            }
+        }
+    }
+    if (hStore) CertCloseStore(hStore,0);
+    if (hMsg) CryptMsgClose(hMsg);
+    return cls;
+}
+
+// 返回 0=有效可信签名; 1=无签名; 2=签名无效或不可信
+static int VerifyFileSignature(const std::wstring& path) {
+    WINTRUST_FILE_INFO fi; ZeroMemory(&fi, sizeof(fi));
+    fi.cbStruct = sizeof(fi);
+    fi.pcwszFilePath = path.c_str();
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA wd; ZeroMemory(&wd, sizeof(wd));
+    wd.cbStruct = sizeof(wd);
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    wd.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+    LONG rc = WinVerifyTrust(nullptr, &action, &wd);
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &wd);
+    if (rc == 0) return 0;
+    if (rc == TRUST_E_NOSIGNATURE) return 1;
+    return 2;
+}
+
+static bool ReadAllBytes(const std::wstring& path, std::vector<BYTE>& buf) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart > 200*1024*1024) { CloseHandle(h); return false; }
+    buf.resize((size_t)sz.QuadPart);
+    DWORD got = 0; BOOL ok = ReadFile(h, buf.data(), (DWORD)buf.size(), &got, nullptr);
+    CloseHandle(h);
+    return ok && got == buf.size();
+}
+
+static DWORD RvaToOffset(const BYTE* base, DWORD rva) {
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+        if (rva >= sec[i].VirtualAddress &&
+            rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+            return rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
+    return 0;
+}
+
+// 静态解析 PE 导入表，返回导入模块文件名（小写）
+static std::vector<std::wstring> PeImportedModules(const std::wstring& path) {
+    std::vector<std::wstring> names;
+    std::vector<BYTE> buf;
+    if (!ReadAllBytes(path, buf) || buf.size() < sizeof(IMAGE_DOS_HEADER)) return names;
+    BYTE* base = buf.data();
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return names;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return names;
+    DWORD impRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if (!impRva) return names;
+    DWORD impOff = RvaToOffset(base, impRva);
+    if (!impOff || impOff + sizeof(IMAGE_IMPORT_DESCRIPTOR) > buf.size()) return names;
+    IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(base + impOff);
+    for (; d->Name; ++d) {
+        DWORD no = RvaToOffset(base, d->Name);
+        if (!no || no >= buf.size() || no + 256 > buf.size()) continue;
+        std::string s((char*)(base + no));
+        size_t bs = s.find_last_of("\\/");
+        if (bs != std::string::npos) s = s.substr(bs+1);
+        int wn = MultiByteToWideChar(CP_ACP,0,s.c_str(),-1,nullptr,0);
+        std::wstring ws(wn,0);
+        MultiByteToWideChar(CP_ACP,0,s.c_str(),-1,&ws[0],wn);
+        if (!ws.empty() && ws.back()==0) ws.pop_back();
+        ws = Lower(ws);
+        if (!ws.empty()) names.push_back(ws);
+    }
+    return names;
+}
+
+// 名称是否随机/哈希样式（GUID、长hex、无元音随机串、长纯数字）
+static bool LooksRandomName(const std::wstring& name0) {
+    std::wstring s;
+    for (wchar_t ch : Lower(name0)) if (iswalnum(ch)) s += ch;
+    if (s.size() < 8) return false;
+    bool allHex=true, hasDigit=false;
+    for (wchar_t ch : s) {
+        if (iswdigit(ch)) hasDigit=true;
+        else if (!(ch>=L'a' && ch<=L'f')) allHex=false;
+    }
+    if (allHex && hasDigit) return true;
+    bool allDig=true; for (wchar_t ch:s) if(!iswdigit(ch)) allDig=false;
+    if (allDig) return true;
+    if (s.size()>=10) {
+        int vow=0, letters=0;
+        for (wchar_t ch:s) if(iswalpha(ch)){letters++;
+            if(ch==L'a'||ch==L'e'||ch==L'i'||ch==L'o'||ch==L'u') vow++;}
+        if (letters>=6 && (double)vow/letters < 0.18) return true;
+    }
+    return false;
+}
+
+// 目录内（最多两层）是否出现关键字
+static bool DirTreeHasKeyword(const std::wstring& dir, const std::vector<std::wstring>& kw) {
+    std::vector<std::wstring> cur = { dir };
+    std::vector<std::wstring> nxt;
+    for (int depth=0; depth<2; ++depth) {
+        for (auto& c : cur) {
+            WIN32_FIND_DATAW fd;
+            HANDLE hf = FindFirstFileW((c+L"\\*").c_str(), &fd);
+            if (hf==INVALID_HANDLE_VALUE) continue;
+            do {
+                if (wcscmp(fd.cFileName,L".")==0||wcscmp(fd.cFileName,L"..")==0) continue;
+                if (MatchKeyword(fd.cFileName,kw)) { FindClose(hf); return true; }
+                if (depth==0 && (fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))
+                    nxt.push_back(c+L"\\"+fd.cFileName);
+            } while(FindNextFileW(hf,&fd));
+            FindClose(hf);
+        }
+        cur = nxt; nxt.clear();
+    }
+    return false;
+}
+
 static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& note) {
     std::vector<ResidualItem> out;
     std::vector<std::wstring> kw = BuildKeywords(a);
@@ -610,8 +784,11 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
             std::wstring nm = fd.cFileName;
+            std::wstring dpath = base + L"\\" + nm;
             if (MatchKeyword(nm, kw))
-                addDir(base + L"\\" + nm);
+                addDir(dpath);
+            else if (LooksRandomName(nm) && DirTreeHasKeyword(dpath, kw))
+                addDir(dpath);
         } while (FindNextFileW(hf, &fd));
         FindClose(hf);
     }
@@ -638,7 +815,7 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
         RegCloseKey(hSvc);
     }
 
-    // 4) drivers 目录厂商 .sys（严格白名单）
+    // 4) drivers 目录：微软系统签名保护；第三方/无签名且名字命中才删
     wchar_t winDir[MAX_PATH]; GetWindowsDirectoryW(winDir, MAX_PATH);
     std::wstring drivers = std::wstring(winDir) + L"\\System32\\drivers";
     WIN32_FIND_DATAW fd;
@@ -646,10 +823,57 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
     if (hf != INVALID_HANDLE_VALUE) {
         do {
             std::wstring nm = fd.cFileName;
-            if (MatchKeyword(nm, kw))
-                addFile(drivers + L"\\" + nm, true);
+            std::wstring full = drivers + L"\\" + nm;
+            if (ClassifyFileSignature(full) == 0) continue;  // 微软系统驱动，保护
+            if (MatchKeyword(nm, kw)) addFile(full, true);
         } while (FindNextFileW(hf, &fd));
         FindClose(hf);
+    }
+
+    // 4b) PE 静态依赖分析：找主目录内 PE 引用的、位于 drivers/System32/主目录的非系统 dll/sys
+    {
+        std::vector<std::wstring> peFiles;
+        std::wstring locLow = Lower(a.location);
+        std::vector<std::wstring> walk = { a.location };
+        while (!walk.empty()) {
+            std::wstring c = walk.back(); walk.pop_back();
+            WIN32_FIND_DATAW fx;
+            HANDLE hx = FindFirstFileW((c+L"\\*").c_str(), &fx);
+            if (hx==INVALID_HANDLE_VALUE) continue;
+            do {
+                if (wcscmp(fx.cFileName,L".")==0||wcscmp(fx.cFileName,L"..")==0) continue;
+                std::wstring cf = c+L"\\"+fx.cFileName;
+                if (fx.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) walk.push_back(cf);
+                else {
+                    std::wstring l = Lower(fx.cFileName);
+                    if (l.size()>=4 &&
+                        (l.substr(l.size()-4)==L".exe"||l.substr(l.size()-4)==L".dll"||
+                         l.substr(l.size()-4)==L".sys")) peFiles.push_back(cf);
+                }
+            } while(FindNextFileW(hx,&fx));
+            FindClose(hx);
+        }
+        std::vector<std::wstring> searchDirs = { drivers,
+            std::wstring(winDir)+L"\\System32", a.location };
+        for (auto& pe : peFiles) {
+            auto deps = PeImportedModules(pe);
+            for (auto& dep : deps) {
+                for (auto& sd : searchDirs) {
+                    std::wstring cand = sd + L"\\" + dep;
+                    if (GetFileAttributesW(cand.c_str())==INVALID_FILE_ATTRIBUTES) continue;
+                    bool inSys = IsSystemDirTree(cand);
+                    int sig = ClassifyFileSignature(cand);
+                    if (sig == 0) continue;        // 微软系统签名，保护
+                    if (inSys) {
+                        // 系统目录默认保护：仅当文件名明确命中目标关键字才纳入
+                        if (MatchKeyword(dep, kw)) addFile(cand, true);
+                    } else {
+                        // 非系统目录的第三方/无签名依赖，纳入（用户勾选确认）
+                        addFile(cand, false);
+                    }
+                }
+            }
+        }
     }
 
     // 5) 盘根一层目录
@@ -673,6 +897,32 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
         addReg(HKEY_LOCAL_MACHINE, L"SOFTWARE\\" + k, KEY_WOW64_64KEY);
         addReg(HKEY_LOCAL_MACHINE, L"SOFTWARE\\" + k, KEY_WOW64_32KEY);
         addReg(HKEY_CURRENT_USER, L"SOFTWARE\\" + k, 0);
+    }
+
+    // 7) 已命中厂商目录下的随机/哈希子目录
+    {
+        std::vector<std::wstring> known;
+        for (auto& i : out) if (i.type==R_DIR) known.push_back(i.path);
+        for (auto& kd : known) {
+            std::vector<std::wstring> walk={kd}, nxt;
+            for (int depth=0;depth<2;++depth) {
+                for (auto& c:walk) {
+                    WIN32_FIND_DATAW fx;
+                    HANDLE hx=FindFirstFileW((c+L"\\*").c_str(),&fx);
+                    if(hx==INVALID_HANDLE_VALUE) continue;
+                    do {
+                        if(wcscmp(fx.cFileName,L".")==0||wcscmp(fx.cFileName,L"..")==0) continue;
+                        std::wstring cf=c+L"\\"+fx.cFileName;
+                        if(fx.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) {
+                            if(LooksRandomName(fx.cFileName)) addDir(cf);
+                            if(depth==0) nxt.push_back(cf);
+                        }
+                    } while(FindNextFileW(hx,&fx));
+                    FindClose(hx);
+                }
+                walk=nxt;nxt.clear();
+            }
+        }
     }
 
     note = L"关键字: ";
@@ -831,8 +1081,16 @@ static void TakeOwnership(ForceCtx* c, const std::wstring& dir) {
     sei.lpParameters = (L"/c " + cmd).c_str();
     sei.nShow = SW_HIDE;
     ShellExecuteExW(&sei);
-    if (sei.hProcess) { WaitForSingleObject(sei.hProcess, 60000); CloseHandle(sei.hProcess); }
-    Log(c, L"  已夺取所有权并授权");
+    if (sei.hProcess) {
+        DWORD wr = WaitForSingleObject(sei.hProcess, 45000);
+        if (wr == WAIT_TIMEOUT) {
+            TerminateProcess(sei.hProcess, 1);
+            Log(c, L"  夺权超时，已跳过 " + dir);
+        } else {
+            Log(c, L"  已夺取所有权并授权");
+        }
+        CloseHandle(sei.hProcess);
+    }
 }
 
 static bool IsSystemDirTree(const std::wstring& p) {
@@ -1025,12 +1283,25 @@ static const wchar_t* SAFEEXE = L"C:\\ProgramData\\MiniGeekSafeClean\\clean.exe"
 static const wchar_t* SAFEPLAN = L"C:\\ProgramData\\MiniGeekSafeClean\\pending.dat";
 static const wchar_t* SAFETASK = L"MiniGeekSafeClean";
 
+// 两段式强制删除（重启续删）
+static const wchar_t* RESUMEDIR = L"C:\\ProgramData\\MiniGeekResume";
+static const wchar_t* RESUMEPLAN = L"C:\\ProgramData\\MiniGeekResume\\plan.dat";
+static const wchar_t* RUNONCE_SUB =
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
+
 struct DlgState {
     AppInfo app;
     std::vector<ResidualItem> items;
-    HWND hList;
+    HWND hTree;
+    bool forceMode = false;
+    std::vector<ResidualItem> pool;   // 树节点 lParam 存此 vector 的下标
 };
 static DlgState g_dlg;
+
+// 两段式阶段二：重启续删（需在主窗过程之前声明）
+static bool g_resumeWanted = false;
+static AppInfo g_resumeApp;
+static std::vector<ResidualItem> g_resumeItems;
 
 static int RunHidden(const std::wstring& cmd) {
     SHELLEXECUTEINFOW s = { sizeof(s) };
@@ -1047,9 +1318,9 @@ static int RunHidden(const std::wstring& cmd) {
 static std::wstring EncodeRoot(HKEY r) { return r == HKEY_CURRENT_USER ? L"1" : L"0"; }
 static HKEY DecodeRoot(const std::wstring& s) { return s == L"1" ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE; }
 
-static void WritePlan(const AppInfo& app, std::vector<ResidualItem>& items) {
-    CreateDirectoryW(SAFEDIR, nullptr);
-    HANDLE hf = CreateFileW(SAFEPLAN, GENERIC_WRITE, 0, nullptr,
+static void WritePlan(const wchar_t* path, const AppInfo& app,
+                      std::vector<ResidualItem>& items) {
+    HANDLE hf = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     auto wl = [&](const std::wstring& line) {
         std::wstring l = line + L"\n";
@@ -1074,8 +1345,9 @@ static std::vector<std::wstring> SplitTab(const std::wstring& s) {
     return out;
 }
 
-static bool ReadPlan(AppInfo& app, std::vector<ResidualItem>& items) {
-    HANDLE hf = CreateFileW(SAFEPLAN, GENERIC_READ, FILE_SHARE_READ, nullptr,
+static bool ReadPlan(const wchar_t* path, AppInfo& app,
+                     std::vector<ResidualItem>& items) {
+    HANDLE hf = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                             OPEN_EXISTING, 0, nullptr);
     if (hf == INVALID_HANDLE_VALUE) return false;
     DWORD sz = GetFileSize(hf, nullptr);
@@ -1126,7 +1398,7 @@ static bool PrepareSafeMode(const AppInfo& app, std::vector<ResidualItem>& items
     CreateDirectoryW(SAFEDIR, nullptr);
     wchar_t self[MAX_PATH]; GetModuleFileNameW(nullptr, self, MAX_PATH);
     CopyFileW(self, SAFEEXE, FALSE);
-    WritePlan(app, items);
+    WritePlan(SAFEPLAN, app, items);
 
     // 1) 备份并改写 Winlogon Userinit（安全模式必经，不依赖任务计划服务）
     std::wstring orig = RegGetStr(HKEY_LOCAL_MACHINE, WINLOGON_SUB,
@@ -1180,7 +1452,7 @@ static int RunSafeClean() {
     }
 
     AppInfo app; std::vector<ResidualItem> items;
-    if (ReadPlan(app, items)) {
+    if (ReadPlan(SAFEPLAN, app, items)) {
         wlog(L"读取计划: " + std::to_wstring(items.size()) + L" 项, app=" + app.name);
         std::wstring note;
         std::vector<ResidualItem> fresh = ScanResidual(app, note);
@@ -1221,38 +1493,86 @@ static void StartDelete(std::vector<ResidualItem>& chosen, const AppInfo& app) {
     CreateThread(nullptr, 0, ForceThread, c, 0, nullptr);
 }
 
+// ================= TreeView 残留窗辅助 =================
+static HTREEITEM TVInsert(HWND ht, HTREEITEM parent, const std::wstring& text, int idx) {
+    TVINSERTSTRUCTW ins; ZeroMemory(&ins, sizeof(ins));
+    ins.hParent = parent ? parent : TVI_ROOT;
+    ins.hInsertAfter = TVI_LAST;
+    ins.item.mask = TVIF_TEXT | TVIF_PARAM;
+    ins.item.pszText = (LPWSTR)text.c_str();
+    ins.item.lParam = idx;
+    return TreeView_InsertItem(ht, &ins);
+}
+static void TVSetCheck(HWND ht, HTREEITEM node, bool chk) {
+    TVITEMW it; ZeroMemory(&it, sizeof(it));
+    it.hItem = node; it.mask = TVIF_STATE; it.stateMask = TVIS_STATEIMAGEMASK;
+    it.state = INDEXTOSTATEIMAGEMASK(chk ? 2 : 1);
+    TreeView_SetItem(ht, &it);
+}
+static void TVCascade(HWND ht, HTREEITEM node, bool chk) {
+    TVSetCheck(ht, node, chk);
+    HTREEITEM c = TreeView_GetChild(ht, node);
+    while (c) { TVCascade(ht, c, chk); c = TreeView_GetNextSibling(ht, c); }
+}
+// 递归枚举文件系统，把子目录/文件加入树（深度限制 3 层，防止卡顿）
+static void AddFsChildren(HWND ht, HTREEITEM parent, const std::wstring& dir, int depth) {
+    WIN32_FIND_DATAW fd;
+    HANDLE hf = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        std::wstring child = dir + L"\\" + fd.cFileName;
+        ResidualItem r; r.display = fd.cFileName;
+        bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        r.type = isDir ? R_DIR : R_FILE; r.path = child;
+        int idx = (int)g_dlg.pool.size(); g_dlg.pool.push_back(r);
+        HTREEITEM node = TVInsert(ht, parent, fd.cFileName, idx);
+        if (isDir && depth < 3) AddFsChildren(ht, node, child, depth + 1);
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+}
+// 收集：节点勾选且无勾选祖先 → 加入 chosen（勾整目录只加目录项）
+static void CollectWalk(HWND ht, HTREEITEM node, bool ancestorChk,
+                        std::vector<ResidualItem>& chosen) {
+    bool self = TreeView_GetCheckState(ht, node) == 1;
+    if (self && !ancestorChk) {
+        TVITEMW q; ZeroMemory(&q, sizeof(q));
+        q.hItem = node; q.mask = TVIF_PARAM;
+        TreeView_GetItem(ht, &q);
+        chosen.push_back(g_dlg.pool[(int)q.lParam]);
+    }
+    HTREEITEM c = TreeView_GetChild(ht, node);
+    while (c) { CollectWalk(ht, c, self || ancestorChk, chosen);
+                c = TreeView_GetNextSibling(ht, c); }
+}
+
+static void StartForceTwoStage(HWND h, const AppInfo& app,
+                               std::vector<ResidualItem>& chosen);
+
 static LRESULT CALLBACK WndResidual(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
             10, 10, 690, 20, h, (HMENU)4100, g_hInst, nullptr);
-        g_dlg.hList = CreateWindowExW(0, WC_LISTVIEWW, L"",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+        g_dlg.pool.clear();
+        g_dlg.hTree = CreateWindowExW(0, WC_TREEVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
+            TVS_HASBUTTONS | TVS_HASLINES |
+            TVS_LINESATROOT | TVS_CHECKBOXES | TVS_FULLROWSELECT,
             10, 38, 690, 380, h, (HMENU)(INT_PTR)IDC_DLLIST, g_hInst, nullptr);
-        ListView_SetExtendedListViewStyle(g_dlg.hList,
-            LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES | LVS_EX_DOUBLEBUFFER);
-        LVCOLUMNW c = {0};
-        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-        const wchar_t* cn[] = { L"名称", L"位置 / 注册表项", L"类型" };
-        int cw[] = { 220, 390, 70 };
-        for (int i = 0; i < 3; ++i) {
-            c.iSubItem = i; c.cx = cw[i]; c.pszText = (LPWSTR)cn[i];
-            ListView_InsertColumn(g_dlg.hList, i, &c);
-        }
-        int row = 0;
+        int topN = 0;
         for (auto& it : g_dlg.items) {
-            LVITEMW li = {0};
-            li.mask = LVIF_TEXT; li.iItem = row;
-            li.pszText = (LPWSTR)it.display.c_str();
-            ListView_InsertItem(g_dlg.hList, &li);
-            std::wstring loc = (it.type == R_REG || it.type == R_REGV) ? it.regSubkey : it.path;
-            ListView_SetItemText(g_dlg.hList, row, 1, (LPWSTR)loc.c_str());
-            const wchar_t* tn[] = { L"目录", L"文件", L"注册表", L"注册表值" };
-            ListView_SetItemText(g_dlg.hList, row, 2, (LPWSTR)tn[it.type]);
-            ListView_SetCheckState(g_dlg.hList, row, TRUE);
-            ++row;
+            int idx = (int)g_dlg.pool.size(); g_dlg.pool.push_back(it);
+            HTREEITEM node = TVInsert(g_dlg.hTree, nullptr, it.display, idx);
+            if (it.type == R_DIR) AddFsChildren(g_dlg.hTree, node, it.path, 0);
+            ++topN;
         }
-        wchar_t t[128]; wsprintfW(t, L"发现 %d 项残留，请勾选要清理的项目", row);
+        // 默认全部勾选
+        HTREEITEM rr = TreeView_GetRoot(g_dlg.hTree);
+        while (rr) { TVCascade(g_dlg.hTree, rr, true);
+                     rr = TreeView_GetNextSibling(g_dlg.hTree, rr); }
+        wchar_t t[128];
+        wsprintfW(t, L"发现 %d 项残留，可展开目录查看并勾选要清理的项目", topN);
         SetWindowTextW(GetDlgItem(h, 4100), t);
 
         const wchar_t* bn[] = { L"全选", L"全不选", L"删除选中", L"取消" };
@@ -1271,39 +1591,45 @@ static LRESULT CALLBACK WndResidual(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
         }
-        EnumChildWindows(h, [](HWND c, LPARAM lp) -> BOOL {
-            SendMessageW(c, WM_SETFONT, (WPARAM)lp, TRUE); return TRUE;
+        EnumChildWindows(h, [](HWND c, LPARAM x) -> BOOL {
+            SendMessageW(c, WM_SETFONT, (WPARAM)x, TRUE); return TRUE;
         }, (LPARAM)g_hFont);
+        break;
+    }
+    case WM_NOTIFY: {
+        LPNMHDR nm = (LPNMHDR)lp;
+        if (nm->idFrom == IDC_DLLIST && nm->code == TVN_ITEMCHANGEDW) {
+            NMTVITEMCHANGE* tc = (NMTVITEMCHANGE*)nm;
+            if (tc->uChanged & TVIF_STATE) {
+                int si = (tc->uStateNew & TVIS_STATEIMAGEMASK) >> 12;
+                TVCascade(g_dlg.hTree, tc->hItem, si == 2);
+            }
+        }
         break;
     }
     case WM_COMMAND: {
         int id = LOWORD(wp);
-        int n = ListView_GetItemCount(g_dlg.hList);
         if (id == DL_ALL || id == DL_NONE) {
-            BOOL chk = id == DL_ALL;
-            for (int i = 0; i < n; ++i) ListView_SetCheckState(g_dlg.hList, i, chk);
+            bool chk = id == DL_ALL;
+            HTREEITEM rr = TreeView_GetRoot(g_dlg.hTree);
+            while (rr) { TVCascade(g_dlg.hTree, rr, chk);
+                         rr = TreeView_GetNextSibling(g_dlg.hTree, rr); }
         } else if (id == DL_CANCEL) {
             DestroyWindow(h);
-        } else if (id == DL_DELETE || id == DL_SAFE) {
+        } else if (id == DL_DELETE) {
             std::vector<ResidualItem> chosen;
-            for (int i = 0; i < n; ++i)
-                if (ListView_GetCheckState(g_dlg.hList, i)) chosen.push_back(g_dlg.items[i]);
-            if (chosen.empty()) { MessageBoxW(h, L"没有勾选任何项目。", L"提示", MB_OK); break; }
-            if (id == DL_SAFE) {
-                std::wstring detail;
-                if (MessageBoxW(h, L"将部署安全模式清理任务并自动重启，期间电脑会重启两次，是否继续？",
-                    L"安全模式彻底删除", MB_YESNO | MB_ICONWARNING) != IDYES) break;
-                bool ok = PrepareSafeMode(g_dlg.app, chosen, detail);
-                if (!ok) {
-                    MessageBoxW(h, (L"部署失败：" + detail).c_str(), L"错误", MB_OK | MB_ICONERROR);
-                    break;
-                }
-                DestroyWindow(h);
-                RunHidden(L"shutdown.exe /r /t 3");
-                return 0;
+            HTREEITEM rr = TreeView_GetRoot(g_dlg.hTree);
+            while (rr) { CollectWalk(g_dlg.hTree, rr, false, chosen);
+                         rr = TreeView_GetNextSibling(g_dlg.hTree, rr); }
+            if (chosen.empty()) {
+                MessageBoxW(h, L"没有勾选任何项目。", L"提示", MB_OK); break;
             }
-            DestroyWindow(h);
-            StartDelete(chosen, g_dlg.app);
+            if (g_dlg.forceMode) {
+                StartForceTwoStage(h, g_dlg.app, chosen);
+            } else {
+                DestroyWindow(h);
+                StartDelete(chosen, g_dlg.app);
+            }
         }
         break;
     }
@@ -1317,9 +1643,82 @@ static LRESULT CALLBACK WndResidual(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return 0;
 }
 
-static void ShowResidualDialog(const AppInfo& app) {
+// ================= 删除结果日志对话框（带竖向滚动条） =================
+static std::wstring g_logText;
+static bool g_logNeed = false, g_logRebootChosen = false;
+static LRESULT CALLBACK WndLog(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        HWND ed = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER |
+            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            12, 12, 676, 360, h, (HMENU)4200, g_hInst, nullptr);
+        SetWindowTextW(ed, g_logText.c_str());
+        SendMessageW(ed, EM_SETSEL, 0x7FFFFFFF, 0x7FFFFFFF);
+        SendMessageW(ed, EM_SCROLLCARET, 0, 0);
+        if (g_logNeed) {
+            CreateWindowW(L"BUTTON", L"立即重启", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                488, 384, 100, 32, h, (HMENU)4201, g_hInst, nullptr);
+            CreateWindowW(L"BUTTON", L"暂不重启", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                588, 384, 100, 32, h, (HMENU)4202, g_hInst, nullptr);
+        } else {
+            CreateWindowW(L"BUTTON", L"完成", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                588, 384, 100, 32, h, (HMENU)4201, g_hInst, nullptr);
+        }
+        if (!g_hFont) {
+            HDC hdc0 = GetDC(nullptr);
+            int fh = -MulDiv(9, GetDeviceCaps(hdc0, LOGPIXELSY), 72);
+            ReleaseDC(nullptr, hdc0);
+            g_hFont = CreateFontW(fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
+        EnumChildWindows(h, [](HWND c, LPARAM x) -> BOOL {
+            SendMessageW(c, WM_SETFONT, (WPARAM)x, TRUE); return TRUE;
+        }, (LPARAM)g_hFont);
+        break;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == 4201) { g_logRebootChosen = g_logNeed; DestroyWindow(h); }
+        else if (id == 4202) { g_logRebootChosen = false; DestroyWindow(h); }
+        break;
+    }
+    case WM_CLOSE: g_logRebootChosen = false; DestroyWindow(h); break;
+    default: return DefWindowProcW(h, msg, wp, lp);
+    }
+    return 0;
+}
+static bool ShowLogDialog(const std::wstring& log, bool needReboot) {
+    g_logText = log; g_logNeed = needReboot; g_logRebootChosen = false;
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = WndLog; wc.hInstance = g_hInst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = L"MiniGeekLogDlg";
+    RegisterClassW(&wc);
+    RECT r; GetWindowRect(g_hMain, &r);
+    int W = 700, H = 460;
+    int x = r.left + ((r.right - r.left) - W) / 2;
+    int y = r.top + 40;
+    EnableWindow(g_hMain, FALSE);
+    HWND h = CreateWindowW(L"MiniGeekLogDlg",
+        needReboot ? L"需要重启" : L"强制删除完成",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, g_hMain, nullptr, g_hInst, nullptr);
+    ShowWindow(h, SW_SHOW); UpdateWindow(h);
+    MSG msg;
+    while (IsWindow(h) && GetMessageW(&msg, 0, 0, 0) > 0) {
+        if (!IsDialogMessageW(h, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    EnableWindow(g_hMain, TRUE); SetForegroundWindow(g_hMain);
+    return g_logRebootChosen;
+}
+
+static void ShowResidualDialog(const AppInfo& app, bool forceMode) {
     std::wstring note;
     g_dlg.app = app;
+    g_dlg.forceMode = forceMode;
     g_dlg.items = ScanResidual(app, note);
     if (g_dlg.items.empty()) {
         MessageBoxW(g_hMain, L"没有发现残留。", L"提示", MB_OK);
@@ -1382,12 +1781,12 @@ static void DoNormalUninstall(const AppInfo& a) {
     else if (MessageBoxW(g_hMain,
                  L"卸载程序已启动。请在软件自带卸载完成后，点“是”扫描并清理残留。",
                  L"扫描残留", MB_YESNO | MB_ICONQUESTION) == IDYES)
-        ShowResidualDialog(a);
+        ShowResidualDialog(a, false);
 }
 
 static void DoForceDelete(const AppInfo& a) {
-    // 强制删除：直接扫描并进入勾选窗（窗内确认删除，安全可控）
-    ShowResidualDialog(a);
+    // 强制删除：扫描进入勾选窗；确认后走两段式（禁用服务→重启→续删）
+    ShowResidualDialog(a, true);
 }
 
 static void OpenLocation(const AppInfo& a) {
@@ -1493,6 +1892,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
         EnumerateApps();
         PopulateList();
+
+        // 重启续删：主窗就绪后自动继续删除（此时目标防护未加载）
+        if (g_resumeWanted) {
+            g_resumeWanted = false;
+            if (ReadPlan(RESUMEPLAN, g_resumeApp, g_resumeItems) &&
+                !g_resumeItems.empty()) {
+                SetWindowTextW(g_hStatus, L"重启后续清理：正在删除...");
+                StartDelete(g_resumeItems, g_resumeApp);
+            }
+        }
         break;
     }
     case WM_SIZE: {
@@ -1559,12 +1968,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         EnableWindow(g_hList, TRUE);
         EnumerateApps(); PopulateList();
         bool needReboot = c->log.find(L"重启后删除") != std::wstring::npos;
-        std::wstring out = c->log;
-        if (needReboot) out += L"\r\n部分文件需要重启才能删除，是否立即重启电脑？";
-        int r = MessageBoxW(g_hMain, out.c_str(),
-                            needReboot ? L"需要重启" : L"强制删除完成",
-                            needReboot ? MB_YESNO | MB_ICONQUESTION : MB_OK);
-        if (needReboot && r == IDYES) {
+        bool reboot = ShowLogDialog(c->log, needReboot);
+        if (needReboot && reboot) {
             HANDLE tp;
             TOKEN_PRIVILEGES priv = {0};
             if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &tp)) {
@@ -1623,6 +2028,76 @@ static int DisableLegacyDriver(const std::wstring& svc, std::wstring& detail) {
     return 0;
 }
 
+// 枚举并禁用所有匹配目标的服务/驱动（Start=4），返回禁用数量
+static int DisableMatchingServices(const std::wstring& baseLow,
+                                   const std::vector<std::wstring>& kw) {
+    int cnt = 0;
+    HKEY hSvc;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SYSTEM\\CurrentControlSet\\Services", 0,
+            KEY_READ | KEY_WOW64_64KEY, &hSvc) != ERROR_SUCCESS) return 0;
+    DWORD i = 0;
+    for (;;) {
+        wchar_t name[256]; DWORD nl = 256;
+        if (RegEnumKeyExW(hSvc, i++, name, &nl, 0, 0, 0, 0) != ERROR_SUCCESS) break;
+        std::wstring sname = name;
+        std::wstring svc = L"SYSTEM\\CurrentControlSet\\Services\\" + sname;
+        std::wstring img = RegGetStr(HKEY_LOCAL_MACHINE, svc, L"ImagePath", KEY_WOW64_64KEY);
+        std::wstring imgLow = Lower(img);
+        if (imgLow.find(L"\\??\\") == 0) imgLow = imgLow.substr(4);
+        bool match = (!baseLow.empty() && imgLow.find(baseLow) == 0)
+                     || MatchKeyword(sname, kw);
+        if (!match || IsCriticalService(sname)) continue;
+        std::wstring detail;
+        if (DisableLegacyDriver(sname, detail) == 0) ++cnt;
+    }
+    RegCloseKey(hSvc);
+    return cnt;
+}
+
+static void DoReboot() {
+    HANDLE tp; TOKEN_PRIVILEGES priv = {0};
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &tp)) {
+        LookupPrivilegeValueW(0, SE_SHUTDOWN_NAME, &priv.Privileges[0].Luid);
+        priv.PrivilegeCount = 1;
+        priv.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(tp, 0, &priv, 0, 0, 0);
+        CloseHandle(tp);
+    }
+    ExitWindowsEx(EWX_REBOOT, SHTDN_REASON_MAJOR_OPERATINGSYSTEM);
+}
+
+// 两段式阶段一：禁用服务/驱动 → 写计划 → 注册 RunOnce → 提示重启
+static void StartForceTwoStage(HWND h, const AppInfo& app,
+                               std::vector<ResidualItem>& chosen) {
+    std::vector<std::wstring> kw = BuildKeywords(app);
+    int disabled = DisableMatchingServices(Lower(app.location), kw);
+
+    if (disabled == 0) {
+        MessageBoxW(g_hMain,
+            L"未能禁用目标的任何服务/驱动（被其自我保护拦截）。\n请先在该安全软件中把本工具加入信任名单，或等待代码签名通过后再试。\n本次不会重启。",
+            L"无法继续", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    CreateDirectoryW(RESUMEDIR, nullptr);
+    WritePlan(RESUMEPLAN, app, chosen);
+
+    wchar_t self[MAX_PATH]; GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring cmd = std::wstring(L"\"") + self + L"\" --resume-delete";
+    SetRegSz(HKEY_LOCAL_MACHINE, RUNONCE_SUB, L"MiniGeekResume",
+             cmd, KEY_WOW64_64KEY);
+
+    DestroyWindow(h);
+    wchar_t msg[300];
+    StringCchPrintfW(msg, 300,
+        L"已禁用 %d 个相关服务/驱动。\n需要重启一次以解除自我保护；重启登录后本工具会自动继续删除（会再弹一次 UAC，请点“是”）。\n\n是否立即重启？",
+        disabled);
+    if (MessageBoxW(g_hMain, msg, L"需要重启",
+                    MB_YESNO | MB_ICONQUESTION) == IDYES)
+        DoReboot();
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     g_hInst = hInst;
 
@@ -1653,6 +2128,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     if (safeMode) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         return RunSafeClean();
+    }
+
+    // 重启续删：--resume-delete
+    {
+        int rc2 = 0;
+        LPWSTR* av = CommandLineToArgvW(GetCommandLineW(), &rc2);
+        for (int i = 0; i < rc2; ++i)
+            if (wcscmp(av[i], L"--resume-delete") == 0) g_resumeWanted = true;
+        if (av) LocalFree(av);
     }
 
     // 临时扫描自测：--test-scan
@@ -1737,6 +2221,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
         }
     }
 
+    // 签名分类自测：--test-sig <path>
+    {
+        int ac = 0;
+        LPWSTR* av = CommandLineToArgvW(GetCommandLineW(), &ac);
+        std::wstring tp;
+        for (int i = 0; i < ac; ++i)
+            if (wcscmp(av[i], L"--test-sig") == 0 && i+1<ac) tp = av[i+1];
+        if (av) LocalFree(av);
+        if (!tp.empty()) {
+            int c = ClassifyFileSignature(tp);
+            FILE* f = _wfopen(L"C:\\sigtest.txt", L"w, ccs=UTF-8");
+            fwprintf(f, L"%s -> class=%d (0系统/1第三方/2无签名/3无效)\n", tp.c_str(), c);
+            fclose(f); return 0;
+        }
+    }
+
     // 若已经是管理员则正常启动；manifest 已要求管理员
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
@@ -1748,7 +2248,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"MiniGeekMainWnd";
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(101), IMAGE_ICON,
+                                 GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
     RegisterClassW(&wc);
 
     int W = 920, H = 600;
@@ -1756,6 +2257,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 3;
     g_hMain = CreateWindowW(L"MiniGeekMainWnd", L"Mini Geek Uninstaller",
         WS_OVERLAPPEDWINDOW, sx, sy, W, H, nullptr, nullptr, hInst, nullptr);
+    HICON hIcoBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(101), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+    HICON hIcoSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(101), IMAGE_ICON,
+                                        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    if (hIcoBig) SendMessageW(g_hMain, WM_SETICON, ICON_BIG, (LPARAM)hIcoBig);
+    if (hIcoSmall) SendMessageW(g_hMain, WM_SETICON, ICON_SMALL, (LPARAM)hIcoSmall);
     ShowWindow(g_hMain, nShow);
     UpdateWindow(g_hMain);
 
