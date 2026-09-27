@@ -14,9 +14,11 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <wincrypt.h>
+#include <aclapi.h>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <functional>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -426,7 +428,12 @@ static bool IsGenericKeyword(const std::wstring& k) {
         L"web", L"app", L"apps", L"software", L"system", L"driver", L"manager",
         L"master", L"box", L"zip", L"file", L"files", L"download", L"player",
         L"viewer", L"editor", L"launcher", L"plugin", L"addon", L"core", L"pro",
-        L"new", L"hot", L"top", L"win", L"pc", L"user"
+        L"new", L"hot", L"top", L"win", L"pc", L"user",
+        L"microsoft", L"windows", L"ms", L"corp", L"inc",
+        L"8wekyb3d8bbwe", L"cw5n1h2txyewy",
+        L"corporation", L"corporationii", L"limited", L"ltd", L"llc",
+        L"company", L"technologies", L"technology", L"international",
+        L"application", L"applications", L"data"
     };
     for (auto w : bad) if (k == w) return true;
     return false;
@@ -724,7 +731,8 @@ static bool DirTreeHasKeyword(const std::wstring& dir, const std::vector<std::ws
             do {
                 if (wcscmp(fd.cFileName,L".")==0||wcscmp(fd.cFileName,L"..")==0) continue;
                 if (MatchKeyword(fd.cFileName,kw)) { FindClose(hf); return true; }
-                if (depth==0 && (fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))
+                if (depth==0 && (fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)
+                    && !(fd.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))
                     nxt.push_back(c+L"\\"+fd.cFileName);
             } while(FindNextFileW(hf,&fd));
             FindClose(hf);
@@ -747,14 +755,15 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
     auto addDir = [&](const std::wstring& p) {
         if (p.empty() || GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) return;
         if (seen(p)) return;
-        ResidualItem r; r.type = R_DIR; r.path = p; r.display = PathFindFileNameW(p.c_str());
+        ResidualItem r; r.type = R_DIR; r.path = p;
+        r.display = L"[文件夹] " + std::wstring(PathFindFileNameW(p.c_str()));
         out.push_back(r);
     };
     auto addFile = [&](const std::wstring& p, bool sys) {
         if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) return;
         if (seen(p)) return;
         ResidualItem r; r.type = R_FILE; r.path = p; r.allowSystem = sys;
-        r.display = PathFindFileNameW(p.c_str());
+        r.display = L"[文件] " + std::wstring(PathFindFileNameW(p.c_str()));
         out.push_back(r);
     };
     auto addReg = [&](HKEY root, const std::wstring& sub, DWORD view, bool svcKey = false) {
@@ -763,7 +772,8 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
         std::wstring key = sub + std::to_wstring((long long)root) + std::to_wstring(view);
         if (seen(key)) return;
         ResidualItem r; r.type = R_REG; r.regRoot = root; r.regView = view;
-        r.regSubkey = sub; r.display = PathFindFileNameW(sub.c_str());
+        r.regSubkey = sub;
+        r.display = L"[注册表] " + std::wstring(PathFindFileNameW(sub.c_str()));
         r.isServicesKey = svcKey;
         out.push_back(r);
     };
@@ -776,7 +786,25 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
         EnvPath(L"APPDATA"), EnvPath(L"LOCALAPPDATA"),
         L"C:\\ProgramData", L"C:\\Program Files", L"C:\\Program Files (x86)",
     };
+    std::function<void(const std::wstring&,int)> drill;
+    drill = [&](const std::wstring& dir, int depth) {
+        WIN32_FIND_DATAW fd;
+        HANDLE hf = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+        if (hf == INVALID_HANDLE_VALUE) return;
+        do {
+            if (wcscmp(fd.cFileName,L".")==0||wcscmp(fd.cFileName,L"..")==0) continue;
+            std::wstring child = dir + L"\\" + fd.cFileName;
+            bool cd = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            bool reparse = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            if (MatchKeyword(fd.cFileName, kw)) {
+                if (cd) addDir(child); else addFile(child, false);
+            } else if (cd && !reparse && depth < 2) drill(child, depth + 1);
+        } while (FindNextFileW(hf, &fd));
+        FindClose(hf);
+    };
     for (const std::wstring& base : bases) {
+        bool deep = (base == EnvPath(L"APPDATA") || base == EnvPath(L"LOCALAPPDATA")
+                     || base == L"C:\\ProgramData");
         WIN32_FIND_DATAW fd;
         HANDLE hf = FindFirstFileW((base + L"\\*").c_str(), &fd);
         if (hf == INVALID_HANDLE_VALUE) continue;
@@ -785,10 +813,15 @@ static std::vector<ResidualItem> ScanResidual(const AppInfo& a, std::wstring& no
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
             std::wstring nm = fd.cFileName;
             std::wstring dpath = base + L"\\" + nm;
-            if (MatchKeyword(nm, kw))
+            std::wstring nlow = Lower(nm);
+            bool isBho = nlow.find(L"bho") != std::wstring::npos ||
+                         nlow.find(L"browserhelper") != std::wstring::npos;
+            if (MatchKeyword(nm, kw) || isBho)
                 addDir(dpath);
             else if (LooksRandomName(nm) && DirTreeHasKeyword(dpath, kw))
                 addDir(dpath);
+            else if (deep && DirTreeHasKeyword(dpath, kw))
+                drill(dpath, 0);
         } while (FindNextFileW(hf, &fd));
         FindClose(hf);
     }
@@ -1034,6 +1067,55 @@ static void RemoveMatchingServices(ForceCtx* c, const std::wstring& dir) {
 }
 
 // 递归删除；失败文件登记重启删除
+static void EnablePrivOnce(const wchar_t* name) {
+    HANDLE tok;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
+    LUID luid;
+    if (LookupPrivilegeValueW(nullptr, name, &luid)) {
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    }
+    CloseHandle(tok);
+}
+
+// 对单个文件/目录夺权：所有者改为 Administrators 并授予完全控制（本地 API，毫秒级）
+static bool GrantAccess(const std::wstring& path) {
+    EnablePrivOnce(SE_TAKE_OWNERSHIP_NAME);
+    EnablePrivOnce(SE_RESTORE_NAME);
+    EnablePrivOnce(SE_SECURITY_NAME);
+
+    PSID pSid = nullptr;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &pSid))
+        return false;
+
+    SetNamedSecurityInfoW((LPWSTR)path.c_str(), SE_FILE_OBJECT,
+                          OWNER_SECURITY_INFORMATION, pSid, nullptr, nullptr, nullptr);
+
+    EXPLICIT_ACCESSW ea; ZeroMemory(&ea, sizeof(ea));
+    ea.grfAccessPermissions = GENERIC_ALL;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+    ea.Trustee.ptstrName = (LPWSTR)pSid;
+
+    PACL oldDacl = nullptr, newDacl = nullptr;
+    GetNamedSecurityInfoW((LPWSTR)path.c_str(), SE_FILE_OBJECT,
+                          DACL_SECURITY_INFORMATION, nullptr, nullptr, &oldDacl, nullptr, nullptr);
+    bool ok = SetEntriesInAclW(1, &ea, oldDacl, &newDacl) == ERROR_SUCCESS;
+    if (ok)
+        SetNamedSecurityInfoW((LPWSTR)path.c_str(), SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION, nullptr, nullptr, newDacl, nullptr);
+    if (newDacl) LocalFree(newDacl);
+    FreeSid(pSid);
+    return ok;
+}
+
 static void DeleteRecursive(ForceCtx* c, const std::wstring& path, bool isDir) {
     if (isDir) {
         DWORD attr = GetFileAttributesW(path.c_str());
@@ -1055,6 +1137,7 @@ static void DeleteRecursive(ForceCtx* c, const std::wstring& path, bool isDir) {
             FindClose(hf);
         }
         if (!RemoveDirectoryW(path.c_str())) {
+            if (GrantAccess(path) && RemoveDirectoryW(path.c_str())) return;
             MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
             Log(c, L"  目录将在重启后删除: " + path);
         }
@@ -1064,6 +1147,7 @@ static void DeleteRecursive(ForceCtx* c, const std::wstring& path, bool isDir) {
         if (attr & FILE_ATTRIBUTE_READONLY)
             SetFileAttributesW(path.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
         if (!DeleteFileW(path.c_str())) {
+            if (GrantAccess(path) && DeleteFileW(path.c_str())) return;
             if (MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT))
                 Log(c, L"  文件将在重启后删除: " + path);
         }
@@ -1201,13 +1285,14 @@ static void ExecuteItems(ForceCtx* c) {
         if (it.type == R_REG && it.regSubkey.find(SP) == 0)
             StopDeleteServiceByName(c, it.regSubkey.substr(SP.size()));
     }
-    Log(c, L"[3/4] 夺权并删除文件...");
+    Log(c, L"[3/4] 删除文件（仅对删不掉的项夺权）...");
+    KillProcessesIn(c, c->app.location);
     for (auto& it : c->items) {
         if (it.type == R_DIR) {
             if (!IsSafeToDeletePath(it.path, true)) {
                 Log(c, L"  受保护路径，跳过 " + it.path); continue;
             }
-            TakeOwnership(c, it.path);
+            DeleteRecursive(c, it.path, true);
         } else if (it.type == R_FILE) {
             if (!IsSafeToDeletePath(it.path, false)) {
                 Log(c, L"  受保护路径，跳过 " + it.path); continue;
@@ -1215,26 +1300,6 @@ static void ExecuteItems(ForceCtx* c) {
             if (IsSystemDirTree(it.path) && !it.allowSystem) {
                 Log(c, L"  受保护，跳过 " + it.path); continue;
             }
-            if (it.allowSystem) {
-                // 单文件夺权
-                std::wstring cmd = L"takeown.exe /f \"" + it.path + L"\" >nul 2>&1 & icacls.exe \""
-                                 + it.path + L"\" /grant administrators:F >nul 2>&1";
-                SHELLEXECUTEINFOW s = { sizeof(s) };
-                s.lpFile = L"cmd.exe"; s.lpParameters = (L"/c " + cmd).c_str();
-                s.nShow = SW_HIDE; s.fMask = SEE_MASK_NOCLOSEPROCESS;
-                ShellExecuteExW(&s);
-                if (s.hProcess) { WaitForSingleObject(s.hProcess, 10000); CloseHandle(s.hProcess); }
-            }
-        }
-    }
-    KillProcessesIn(c, c->app.location);
-    for (auto& it : c->items) {
-        if (it.type == R_DIR) {
-            if (!IsSafeToDeletePath(it.path, true)) continue;
-            DeleteRecursive(c, it.path, true);
-        } else if (it.type == R_FILE) {
-            if (!IsSafeToDeletePath(it.path, false)) continue;
-            if (IsSystemDirTree(it.path) && !it.allowSystem) continue;
             DeleteRecursive(c, it.path, false);
         }
     }
@@ -1485,22 +1550,60 @@ static int RunSafeClean() {
     return 0;
 }
 
+static bool g_busy = false;
 static void StartDelete(std::vector<ResidualItem>& chosen, const AppInfo& app) {
     ForceCtx* c = new ForceCtx;
     c->app = app; c->items = chosen; c->hNotify = g_hMain;
     EnableWindow(g_hList, FALSE);
     SetWindowTextW(g_hStatus, L"正在删除...");
+    g_busy = true;
     CreateThread(nullptr, 0, ForceThread, c, 0, nullptr);
 }
 
 // ================= TreeView 残留窗辅助 =================
+static HIMAGELIST g_hTreeImg = nullptr;
+static HIMAGELIST BuildTreeImg() {
+    HIMAGELIST il = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 4, 1);
+    auto addIco = [&](HICON ic){ ImageList_AddIcon(il, ic); DestroyIcon(ic); };
+    SHFILEINFOW sfi;
+    SHGetFileInfoW(L"x", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
+                   SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    addIco(sfi.hIcon);
+    SHGetFileInfoW(L"x", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+                   SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    addIco(sfi.hIcon);
+    // 注册表图标：DDB 白底三色立方体，ImageList_Add(NULL mask) 整图不透明
+    {
+        HDC screen = GetDC(nullptr);
+        HBITMAP color = CreateCompatibleBitmap(screen, 16, 16);
+        HDC cdc = CreateCompatibleDC(screen);
+        HBITMAP old = (HBITMAP)SelectObject(cdc, color);
+        PatBlt(cdc, 0,0,16,16, WHITENESS);
+        POINT T[4]={{8,2},{14,5},{8,8},{2,5}};
+        POINT L[4]={{2,5},{8,8},{8,14},{2,11}};
+        POINT R[4]={{8,8},{14,5},{14,11},{8,14}};
+        HBRUSH cT=CreateSolidBrush(RGB(150,205,255)),cL=CreateSolidBrush(RGB(30,95,185)),
+               cR=CreateSolidBrush(RGB(65,145,225));
+        SelectObject(cdc,GetStockObject(NULL_PEN));
+        SelectObject(cdc,cT); Polygon(cdc,T,4);
+        SelectObject(cdc,cL); Polygon(cdc,L,4);
+        SelectObject(cdc,cR); Polygon(cdc,R,4);
+        SelectObject(cdc,old); DeleteDC(cdc);
+        ImageList_Add(il, color, nullptr);
+        DeleteObject(cT);DeleteObject(cL);DeleteObject(cR);DeleteObject(color);
+        ReleaseDC(nullptr,screen);
+    }
+    return il;
+}
 static HTREEITEM TVInsert(HWND ht, HTREEITEM parent, const std::wstring& text, int idx) {
     TVINSERTSTRUCTW ins; ZeroMemory(&ins, sizeof(ins));
     ins.hParent = parent ? parent : TVI_ROOT;
     ins.hInsertAfter = TVI_LAST;
-    ins.item.mask = TVIF_TEXT | TVIF_PARAM;
+    ins.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE;
     ins.item.pszText = (LPWSTR)text.c_str();
     ins.item.lParam = idx;
+    RType rt = g_dlg.pool[idx].type;
+    ins.item.iImage = (rt == R_DIR) ? 0 : (rt == R_FILE) ? 1 : 2;
     return TreeView_InsertItem(ht, &ins);
 }
 static void TVSetCheck(HWND ht, HTREEITEM node, bool chk) {
@@ -1524,10 +1627,11 @@ static void AddFsChildren(HWND ht, HTREEITEM parent, const std::wstring& dir, in
         std::wstring child = dir + L"\\" + fd.cFileName;
         ResidualItem r; r.display = fd.cFileName;
         bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        bool reparse = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
         r.type = isDir ? R_DIR : R_FILE; r.path = child;
         int idx = (int)g_dlg.pool.size(); g_dlg.pool.push_back(r);
         HTREEITEM node = TVInsert(ht, parent, fd.cFileName, idx);
-        if (isDir && depth < 3) AddFsChildren(ht, node, child, depth + 1);
+        if (isDir && !reparse && depth < 3) AddFsChildren(ht, node, child, depth + 1);
     } while (FindNextFileW(hf, &fd));
     FindClose(hf);
 }
@@ -1560,6 +1664,8 @@ static LRESULT CALLBACK WndResidual(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             TVS_HASBUTTONS | TVS_HASLINES |
             TVS_LINESATROOT | TVS_CHECKBOXES | TVS_FULLROWSELECT,
             10, 38, 690, 380, h, (HMENU)(INT_PTR)IDC_DLLIST, g_hInst, nullptr);
+        g_hTreeImg = BuildTreeImg();
+        TreeView_SetImageList(g_dlg.hTree, g_hTreeImg, TVSIL_NORMAL);
         int topN = 0;
         for (auto& it : g_dlg.items) {
             int idx = (int)g_dlg.pool.size(); g_dlg.pool.push_back(it);
@@ -1763,23 +1869,40 @@ static void DoNormalUninstall(const AppInfo& a) {
         return;
     }
     std::wstring cmd = a.uninstallCmd;
-    HINSTANCE r;
+    HCURSOR hOld = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd = g_hMain;
+    sei.lpVerb = L"runas";
+    sei.nShow = SW_SHOWNORMAL;
+
+    std::wstring file, args;
     size_t sp = cmd.find(L".exe");
     if (cmd[0] == L'"' || sp == std::wstring::npos) {
-        // 整串交给 cmd / 或 ShellExecute 解析
-        r = ShellExecuteW(g_hMain, L"runas", L"cmd.exe",
-                          (L"/c " + cmd).c_str(), nullptr, SW_SHOWNORMAL);
+        file = L"cmd.exe";
+        args = L"/c " + cmd;
     } else {
-        std::wstring file = cmd.substr(0, sp + 4);
-        std::wstring args = sp + 4 < cmd.size() ? cmd.substr(sp + 4) : L"";
-        r = ShellExecuteW(g_hMain, L"runas", file.c_str(), args.c_str(),
-                          nullptr, SW_SHOWNORMAL);
+        file = cmd.substr(0, sp + 4);
+        args = sp + 4 < cmd.size() ? cmd.substr(sp + 4) : L"";
     }
-    if ((INT_PTR)r <= 32)
+    sei.lpFile = file.c_str();
+    sei.lpParameters = args.empty() ? nullptr : args.c_str();
+
+    BOOL ok = ShellExecuteExW(&sei);
+    if (!ok || (sei.hProcess == nullptr)) {
+        SetCursor(hOld);
         MessageBoxW(g_hMain, L"无法启动卸载程序，请尝试强制删除。", L"错误",
                     MB_OK | MB_ICONERROR);
-    else if (MessageBoxW(g_hMain,
-                 L"卸载程序已启动。请在软件自带卸载完成后，点“是”扫描并清理残留。",
+        return;
+    }
+    // 等待软件自带卸载程序真正结束（部分卸载器会派生子进程后提前退出，属已知限制）
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    CloseHandle(sei.hProcess);
+    SetCursor(hOld);
+
+    if (MessageBoxW(g_hMain,
+                 L"软件自带卸载已完成。是否扫描并清理残留？",
                  L"扫描残留", MB_YESNO | MB_ICONQUESTION) == IDYES)
         ShowResidualDialog(a, false);
 }
@@ -1965,6 +2088,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_FORCE_DONE: {
         ForceCtx* c = (ForceCtx*)lp;
+        g_busy = false;
         EnableWindow(g_hList, TRUE);
         EnumerateApps(); PopulateList();
         bool needReboot = c->log.find(L"重启后删除") != std::wstring::npos;
@@ -1984,6 +2108,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         delete c;
         break;
     }
+    case WM_CLOSE:
+        if (g_busy) {
+            MessageBoxW(h, L"正在删除，请等待操作完成后再关闭。", L"请稍候",
+                        MB_OK | MB_ICONINFORMATION);
+            break;
+        }
+        DestroyWindow(h);
+        break;
     case WM_DESTROY:
         PostQuitMessage(0);
         break;
