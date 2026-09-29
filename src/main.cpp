@@ -1186,8 +1186,11 @@ static void DeleteRecursive(ForceCtx* c, const std::wstring& path, bool isDir) {
             FindClose(hf);
         }
         if (!RemoveDirectoryW(path.c_str())) {
-            c->nGrant++;
-            if (GrantAccess(path) && RemoveDirectoryW(path.c_str())) return;
+            DWORD e2 = GetLastError();
+            if (e2 == ERROR_ACCESS_DENIED) {
+                c->nGrant++;
+                if (GrantAccess(path) && RemoveDirectoryW(path.c_str())) return;
+            }
             c->nReboot++;
             MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
             Log(c, L"  目录将在重启后删除: " + path);
@@ -1198,8 +1201,12 @@ static void DeleteRecursive(ForceCtx* c, const std::wstring& path, bool isDir) {
         if (attr & FILE_ATTRIBUTE_READONLY)
             SetFileAttributesW(path.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
         if (DeleteFileW(path.c_str())) { c->nFile++; return; }
-        c->nGrant++;
-        if (GrantAccess(path) && DeleteFileW(path.c_str())) { c->nFile++; return; }
+        DWORD e1 = GetLastError();
+        // 仅“拒绝访问”才夺权；被占用(SHARING/LOCK)夺权无用，直接走重启删除
+        if (e1 == ERROR_ACCESS_DENIED) {
+            c->nGrant++;
+            if (GrantAccess(path) && DeleteFileW(path.c_str())) { c->nFile++; return; }
+        }
         if (MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT)) {
             c->nReboot++;
             Log(c, L"  文件将在重启后删除: " + path);
@@ -1335,6 +1342,7 @@ static void ExecuteItems(ForceCtx* c) {
     Log(c, L"[1/4] 结束占用进程..." + StepMs(tw));
     KillProcessesIn(c, c->app.location);
     Log(c, L"[2/4] 停止并删除服务/驱动..." + StepMs(tw));
+    RemoveMatchingServices(c, c->app.location);   // 停删 ImagePath 在该目录下的全部服务/驱动，释放占用
     for (auto& it : c->items) {
         if (it.type == R_REG && it.regSubkey.find(SP) == 0)
             StopDeleteServiceByName(c, it.regSubkey.substr(SP.size()));
