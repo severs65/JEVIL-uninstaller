@@ -2287,8 +2287,9 @@ static int DisableLegacyDriver(const std::wstring& svc, std::wstring& detail) {
 
 // 枚举并禁用所有匹配目标的服务/驱动（Start=4），返回禁用数量
 static int DisableMatchingServices(const std::wstring& baseLow,
-                                   const std::vector<std::wstring>& kw) {
-    int cnt = 0;
+                                   const std::vector<std::wstring>& kw,
+                                   int& matched) {
+    int cnt = 0; matched = 0;
     HKEY hSvc;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
             L"SYSTEM\\CurrentControlSet\\Services", 0,
@@ -2305,6 +2306,7 @@ static int DisableMatchingServices(const std::wstring& baseLow,
         bool match = (!baseLow.empty() && imgLow.find(baseLow) == 0)
                      || MatchKeyword(sname, kw);
         if (!match || IsCriticalService(sname)) continue;
+        ++matched;
         std::wstring detail;
         if (DisableLegacyDriver(sname, detail) == 0) ++cnt;
     }
@@ -2328,15 +2330,27 @@ static void DoReboot() {
 static void StartForceTwoStage(HWND h, const AppInfo& app,
                                std::vector<ResidualItem>& chosen) {
     std::vector<std::wstring> kw = BuildKeywords(app);
-    int disabled = DisableMatchingServices(Lower(app.location), kw);
+    int matched = 0;
+    int disabled = DisableMatchingServices(Lower(app.location), kw, matched);
 
+    // 情况一：该软件没有任何服务/驱动 → 无内核级自我保护，直接当场删除，无需重启
+    if (matched == 0) {
+        DestroyWindow(h);
+        StartDelete(chosen, app);
+        return;
+    }
+    // 情况二：存在服务/驱动，却一个都没能停用 → 被自我保护拦截
     if (disabled == 0) {
         MessageBoxW(g_hMain,
-            L"未能禁用目标的任何服务/驱动（被其自我保护拦截）。\n请先在该安全软件中把本工具加入信任名单，或等待代码签名通过后再试。\n本次不会重启。",
-            L"无法继续", MB_OK | MB_ICONWARNING);
+            L"该软件带有自我保护，暂时无法卸载。\n\n请按以下任一方式处理后，再点一次“强制删除”：\n"
+            L"1. 打开该软件的设置，关闭“自我保护 / 主动防御”；\n"
+            L"2. 把本工具添加到该软件或杀毒软件的“信任区 / 白名单”。\n\n"
+            L"本次不会重启，也不会删除任何文件。",
+            L"请先解除自我保护", MB_OK | MB_ICONWARNING);
         return;
     }
 
+    // 情况三：已成功停用部分或全部服务/驱动 → 写计划，重启后续删
     CreateDirectoryW(RESUMEDIR, nullptr);
     WritePlan(RESUMEPLAN, app, chosen);
 
@@ -2346,10 +2360,12 @@ static void StartForceTwoStage(HWND h, const AppInfo& app,
              cmd, KEY_WOW64_64KEY);
 
     DestroyWindow(h);
-    wchar_t msg[300];
-    StringCchPrintfW(msg, 300,
-        L"已禁用 %d 个相关服务/驱动。\n需要重启一次以解除自我保护；重启登录后本工具会自动继续删除（会再弹一次 UAC，请点“是”）。\n\n是否立即重启？",
-        disabled);
+    wchar_t msg[320];
+    StringCchPrintfW(msg, 320,
+        L"已停用 %d 个相关后台服务/驱动（共发现 %d 个）。\n"
+        L"需要重启一次；重启登录后本工具会自动继续删除（会再弹一次授权提示，请点“是”）。\n\n"
+        L"是否立即重启？",
+        disabled, matched);
     if (MessageBoxW(g_hMain, msg, L"需要重启",
                     MB_YESNO | MB_ICONQUESTION) == IDYES)
         DoReboot();
